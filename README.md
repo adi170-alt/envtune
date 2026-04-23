@@ -8,6 +8,7 @@
 <h1 align="center">🎛️ EnvTune</h1>
 
 > **An advanced, environment-aware personality tuner for Pwnagotchi.**
+> **A hybrid between envtune and auto tune**
 > 
 > EnvTune actively monitors your surroundings and dynamically adjusts your Pwnagotchi's core parameters (`min_rssi`, `hop_recon_time`, `recon_time`, and `max_interactions`) to optimize handshake capture rates and maximize rewards.
 
