@@ -9,7 +9,7 @@ import pwnagotchi.plugins as plugins
 
 
 class EnvTune(plugins.Plugin):
-    __author__ = 'hasj'
+    __author__ = 'adi1708'
     __version__ = '3.0.0'
     __license__ = 'MIT'
     __description__ = 'Environment-aware personality tuner with EMA smoothing, persistence, blind-panic, reward-revert, and best-settings memory.'
