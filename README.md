@@ -36,7 +36,6 @@ Download `envtune.py` and place it in your custom plugins directory (default is 
 ```bash
 wget https://raw.githubusercontent.com/adi170-alt/envtune/main/envtune.py -O /usr/local/share/pwnagotchi/custom-plugins/envtune.py
 ```
-*(⚠️ **Note:** Replace `YOUR_GITHUB_REPO` with your actual raw GitHub link).*
 
 **3. Enable the plugin in your config:**
 Open your configuration file:
