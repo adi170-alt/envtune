@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License" />
 </p>
 
-<h1 align="center">🎛️ EnvTune</h1>
+<h1 align="center">🎛️ EnvTune A hybrid between envtune and auto tune</h1>
 
 > **An advanced, environment-aware personality tuner for Pwnagotchi.**
 > **A hybrid between envtune and auto tune**
