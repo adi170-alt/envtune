@@ -164,6 +164,26 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _is_valid_mac(mac):
+    """Validate a MAC string of form aa:bb:cc:dd:ee:ff."""
+    if not mac or not isinstance(mac, str):
+        return False
+    parts = mac.split(':')
+    if len(parts) != 6:
+        return False
+    for p in parts:
+        if len(p) != 2 or not all(c in '0123456789abcdefABCDEF' for c in p):
+            return False
+    return True
+
+
+def _format_mac_colons(mac_n):
+    """Convert normalised 12-char MAC to colon-separated form. Returns '' on bad input."""
+    if not mac_n or len(mac_n) != 12:
+        return ''
+    return ':'.join(mac_n[i:i+2] for i in range(0, 12, 2))
+
+
 def _detect_hardware():
     """
     Detect Pi hardware for CPU profile defaults.
@@ -327,7 +347,7 @@ class EnvTune(plugins.Plugin):
 
         # UCB
         'ucb_c':                     1.4,
-        'reward_delay':              2,
+        'reward_delay':              3,
         'ucb_c_floor':               0.6,      # lowest C may decay to
         'ucb_c_anneal_epochs':       500,
 
@@ -440,6 +460,17 @@ class EnvTune(plugins.Plugin):
         self.lifetime_handshakes = 0
         self.session_start_wall  = time.time()
         self.session_start_mono  = time.monotonic()
+
+        # Counters synced after _load_state in on_loaded (prevents inflated
+        # diff on first epoch when state has lifetime_new_count > 0).
+        self._lifetime_new_count_prev = 0
+        self._known_aps_count_prev    = 0
+        self._last_loc_change_ep      = -99
+
+        # Bettercap dynamic skip-list — captured BSSIDs we ask bettercap to
+        # deprioritise so radio time goes to *new* targets (the whole point).
+        self._bcap_skip_macs           = set()
+        self._bcap_skip_pushed_count   = 0
 
         # Channel lifetime dict  ch → stats (persistent)
         self._ch_lt = defaultdict(lambda: {
@@ -882,7 +913,7 @@ class EnvTune(plugins.Plugin):
     def _custom_reward(self, handshakes, hs_rate, missed_rate, native_reward,
                        duration_secs, lifetime_new_this_epoch,
                        active_ratio, inactive_ratio, hops_ratio,
-                       new_aps_seen, attack_efficiency_proxy):
+                       new_aps_seen, attack_efficiency_proxy, interactions):
         """
         UNIQUE-handshake-maximising reward.
 
@@ -891,21 +922,22 @@ class EnvTune(plugins.Plugin):
         brand-new network = full reward.
 
         Components (all normalised to [0,1]):
-          - lifetime-new HS per minute         (0.45)  primary objective
-          - total HS efficiency (HS/attack)    (0.10)  secondary
-          - inverse missed rate                (0.10)  efficiency
+          - lifetime-new HS per minute         (0.60)  primary objective
           - new APs discovered this epoch      (0.10)  exploration value
-          - pwnagotchi active ratio            (0.08)  signal we are working
-          - channel hop diversity              (0.05)  coverage
-          - penalty: inactive ratio            (-0.08) penalty for stalls
-          - native pwnagotchi reward           (0.05)  alignment
-          - "underlying work" baseline         (0.05)  prevents 0-hs deadzones
+          - unique-HS-per-attack efficiency    (0.08)  duplicates don't help
+          - inverse missed rate                (0.06)  efficiency
+          - pwnagotchi active ratio            (0.05)  signal we are working
+          - channel hop diversity              (0.04)  coverage
+          - native pwnagotchi reward           (0.03)  loose alignment
+          - "underlying work" baseline         (0.04)  prevents 0-hs deadzones
                                                        from learning nothing
+          - penalty: inactive ratio            (-0.05) penalty for stalls
         """
         dur_min        = max(0.01, duration_secs / 60.0)
         hs_per_min     = handshakes / dur_min
         new_per_min    = lifetime_new_this_epoch / dur_min
-        self._recent_hpm.append(new_per_min)  # track NEW captures, not total
+        # NB: stored in _recent_hpm but tracks UNIQUE-per-min, not total.
+        self._recent_hpm.append(new_per_min)
 
         target = self._adaptive_hpm_target()
 
@@ -925,8 +957,9 @@ class EnvTune(plugins.Plugin):
         else:
             new_term = 0.0
 
-        # 2) Total HS efficiency — captured but maybe duplicates
-        eff_term = min(1.0, hs_rate)
+        # 2) UNIQUE handshake efficiency per attack — duplicates don't count.
+        # Catching the same AP 10× shouldn't beat catching 1 new AP once.
+        eff_term = min(1.0, lifetime_new_this_epoch / max(1, interactions))
 
         # 3) Inverse missed rate
         miss_term = max(0.0, 1.0 - missed_rate)
@@ -951,15 +984,15 @@ class EnvTune(plugins.Plugin):
         work_term = min(1.0, attack_efficiency_proxy)
 
         r = (
-            0.45 * new_term
-          + 0.10 * eff_term
-          + 0.10 * miss_term
+            0.60 * new_term         # ↑ from 0.45 — this IS the goal
           + 0.10 * new_aps_term
-          + 0.08 * active_term
-          + 0.05 * hops_term
-          - 0.08 * inactive_pen
-          + 0.05 * native_term
-          + 0.05 * work_term
+          + 0.08 * eff_term
+          + 0.06 * miss_term
+          + 0.05 * active_term
+          + 0.04 * hops_term
+          - 0.05 * inactive_pen
+          + 0.03 * native_term
+          + 0.04 * work_term
         )
         return max(0.0, min(1.0, r))
 
@@ -988,18 +1021,23 @@ class EnvTune(plugins.Plugin):
         whether there are CURRENTLY VISIBLE uncaptured APs on this channel.
         That signal dominates over historical data once we have it.
         """
-        lt       = self._ch_lt[ch]
-        # Decayed clients-on-channel — _chistos['Clients'] is cumulative
-        # so we can't trust raw values. Use the EMA of recent counts via
-        # _ch_lt['clients'] (also cumulative, but we'll look at known_aps
-        # for the live signal instead — see below).
-        free     = sum(1 for c in self._free_channels if c == ch)
-
-        # CRITICAL: live uncaptured-AP opportunity on this channel
-        live_uncaptured     = 0
+        # FIX: take a single locked snapshot of all _ch_lt / _free_channels /
+        # _gps_zones / _known_aps state we need; concurrent event-handlers
+        # mutate these dicts/lists. After this we work on snapshots only.
+        live_uncaptured           = 0
         live_uncaptured_w_clients = 0
-        live_strong_signals = 0
-        for ap in self._known_aps.values():
+        live_strong_signals       = 0
+        with self._state_lock:
+            lt        = dict(self._ch_lt[ch])
+            free      = sum(1 for c in self._free_channels if c == ch)
+            aps_snap  = list(self._known_aps.values())
+            zone_ch_count = 0
+            if self._current_zone is not None:
+                zc = self._gps_zones.get(self._current_zone, {}).get(
+                    'channels', {})
+                zone_ch_count = zc.get(ch, 0)
+            dead_count = self._dead_lt.get(ch, 0)
+        for ap in aps_snap:
             if _si(ap.get('channel', 0)) != ch:
                 continue
             if not ap.get('AT_visible', False):
@@ -1037,13 +1075,11 @@ class EnvTune(plugins.Plugin):
 
         # Zone-specific channel bonus: if this channel has been
         # productive in the current GPS zone specifically
-        if self._current_zone is not None:
-            zone_ch = self._gps_zones[self._current_zone]['channels']
-            if ch in zone_ch:
-                score += zone_ch[ch] * 1.5
+        if zone_ch_count:
+            score += zone_ch_count * 1.5
 
         score *= max(0.05, 1.0 - float(self.cfg['dead_ch_lifetime_weight'])
-                                 * self._dead_lt.get(ch, 0))
+                                 * dead_count)
         return max(0.0, score)
 
     def _pick_weighted(self, pool, n):
@@ -1123,10 +1159,35 @@ class EnvTune(plugins.Plugin):
             # to ~60-90 seconds even at high hrt
             max_active_in_list = min(6, len(self._active_channels))
             max_total = max_active_in_list + n_extra
+
+            # Identify channels with strong, attackable, uncaptured APs.
+            # These MUST stay in the list even if score-cap would drop them —
+            # losing such a channel = guaranteed missed unique handshake.
+            must_keep = set()
+            with self._state_lock:
+                for ap in list(self._known_aps.values()):
+                    if not ap.get('AT_visible'):
+                        continue
+                    if ap.get('AT_already_captured'):
+                        continue
+                    if ap.get('AT_pmf_detected'):
+                        continue
+                    if ap.get('AT_cooldown_until', 0) > self.epochs_seen:
+                        continue
+                    if _sf(ap.get('rssi', -100)) <= -75:
+                        continue
+                    ch = _si(ap.get('channel', 0))
+                    if ch:
+                        must_keep.add(ch)
+
             if len(next_chs) > max_total:
-                # Keep top max_total by score (next_chs is already sorted)
-                dropped = next_chs[max_total:]
-                next_chs = next_chs[:max_total]
+                # Keep top max_total by score, then add must_keep channels
+                # that didn't make the cap (force-included)
+                top_keep      = next_chs[:max_total]
+                forced_extras = [c for c in must_keep if c not in top_keep]
+                final         = top_keep + forced_extras
+                dropped       = [c for c in next_chs if c not in final]
+                next_chs      = final
                 # Push dropped channels back to unscanned for next cycle
                 for ch in dropped:
                     if ch not in self._unscanned_channels and ch not in next_chs:
@@ -1210,6 +1271,7 @@ class EnvTune(plugins.Plugin):
                         'AT_handshake':        0,
                         'AT_clients':          0,
                         'AT_client_epoch':     -99,
+                        'AT_lastattack_ep':    -99,
                         'AT_missed':           0,
                         'AT_rssi_hist':        deque([_sf(ap.get('rssi', -80))], maxlen=4),
                         'AT_pmf_detected':     False,
@@ -1218,6 +1280,7 @@ class EnvTune(plugins.Plugin):
                         'AT_already_captured': mac_n in self._captured_bssids,
                         'AT_cracked':          mac_n in self._cracked_bssids,
                         'AT_efficiency':       0.0,
+                        'AT_lastseen':         time.monotonic(),
                         tag:                   1,
                     })
                     self._known_aps[apID] = entry
@@ -1354,6 +1417,13 @@ class EnvTune(plugins.Plugin):
         cratio = abs(fp['count'] - old['count']) / max(1, old['count'])
         moved  = jac < 0.30 or rdiff > 15.0 or cratio > 0.70
         self._loc_fp_stored = fp
+        # Debounce: prevents constant retriggering while walking/driving
+        # (zone hops every ~30s would otherwise reset the boost forever
+        # and UCB would never reach exploit phase).
+        if moved and self.epochs_seen - self._last_loc_change_ep < 5:
+            return False
+        if moved:
+            self._last_loc_change_ep = self.epochs_seen
         return moved
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1472,8 +1542,11 @@ class EnvTune(plugins.Plugin):
             return
         zone = self._zone_key(fix['lat'], fix['lon'])
         self._current_zone = zone
-        self._gps_zones[zone]['visits'] += 1
-        self._gps_zones[zone]['last_seen'] = time.time()
+        # FIX: _gps_zones is mutated here AND in on_handshake under lock,
+        # AND read by _ch_score / _build_state_snapshot. Lock both writers.
+        with self._state_lock:
+            self._gps_zones[zone]['visits'] += 1
+            self._gps_zones[zone]['last_seen'] = time.time()
 
     # ─────────────────────────────────────────────────────────────────────
     # Parameter coupling — extensive sanity rules
@@ -1593,6 +1666,10 @@ class EnvTune(plugins.Plugin):
             self._stagnation_count  = 0
             # Also clear cache so UCB recomputes
             self._ucb_cache.clear()
+            # FIX: queued decisions were made under the stagnant policy;
+            # crediting them with rewards from the boost period would
+            # reinforce the very arms we want to escape. Drop the queue.
+            self._decision_buffer.clear()
             logging.info(f'[envtune] Stagnation → '
                          f'{self._exploration_boost}-ep exploration boost')
 
@@ -1746,6 +1823,35 @@ class EnvTune(plugins.Plugin):
             except Exception as e:
                 logging.debug(f'[envtune] bcap sync {bcap_key}={new_val}: {e}')
 
+    def _push_bcap_skip_list(self, agent, force=False):
+        """
+        Push the running set of captured BSSIDs to bettercap's
+        wifi.assoc.skip and wifi.deauth.skip lists.
+
+        Effect: bettercap stops attacking already-captured APs, freeing
+        radio time for *new* targets. This is the single biggest lever
+        for unique-handshake throughput once a session has been running.
+
+        Best-effort: silently no-ops on bettercap builds that don't
+        expose these properties. Coalesces — only pushes when the set
+        has grown since the last push (or force=True).
+        """
+        if agent is None:
+            return
+        n = len(self._bcap_skip_macs)
+        if not force and n == self._bcap_skip_pushed_count:
+            return
+        if not self._bcap_skip_macs:
+            return
+        try:
+            skip_list = ','.join(sorted(self._bcap_skip_macs))
+            agent.run(f'set wifi.assoc.skip {skip_list}')
+            agent.run(f'set wifi.deauth.skip {skip_list}')
+            self._bcap_skip_pushed_count = n
+            logging.debug(f'[envtune] pushed {n} BSSIDs to bcap skip-list')
+        except Exception as e:
+            logging.debug(f'[envtune] bcap skip-list push: {e}')
+
     # ─────────────────────────────────────────────────────────────────────
     # Detect which params this fork exposes (graceful for evilsocket)
     # ─────────────────────────────────────────────────────────────────────
@@ -1781,6 +1887,23 @@ class EnvTune(plugins.Plugin):
             )
             self.lifetime_handshakes = _si(st.get('lifetime_handshakes', 0))
             self._lifetime_new_count = _si(st.get('lifetime_new_count', 0))
+
+            # Restore captured-BSSID set. Without this, lifetime_new_count
+            # could desync from disk-state (deleted pcaps) and re-counting
+            # an already-known BSSID as "new" again would inflate metrics.
+            for m in (st.get('captured_bssids') or []):
+                m_n = self._mac_norm(m)
+                if len(m_n) == 12:
+                    self._captured_bssids.add(m_n)
+
+            # FIX: persist cracked-BSSID set so we don't lose this knowledge
+            # if the wpa-sec potfile is rotated or corrupted between runs.
+            # We re-merge with the live potfile in on_loaded, so this is a
+            # safety net rather than the source of truth.
+            for m in (st.get('cracked_bssids') or []):
+                m_n = self._mac_norm(m)
+                if len(m_n) == 12:
+                    self._cracked_bssids.add(m_n)
 
             for k, v in (st.get('ch_lt') or {}).items():
                 try:
@@ -1831,6 +1954,8 @@ class EnvTune(plugins.Plugin):
                 'ema':                 dict(self.ema),
                 'lifetime_handshakes': self.lifetime_handshakes,
                 'lifetime_new_count':  self._lifetime_new_count,
+                'captured_bssids':     sorted(self._captured_bssids),
+                'cracked_bssids':      sorted(self._cracked_bssids),
                 'ch_lt':   {str(k): dict(v) for k, v in self._ch_lt.items()},
                 'dead_lt': {str(k): v       for k, v in self._dead_lt.items()},
                 'gps_zones': {
@@ -1953,8 +2078,10 @@ class EnvTune(plugins.Plugin):
         # Apply time-of-day priors (only fills n=0 entries)
         self._apply_tod_prior()
 
-        # Scan handshake dir for already-captured BSSIDs
-        self._captured_bssids = self._scan_handshake_dir()
+        # Merge state-restored BSSIDs with current handshake-dir scan.
+        # State has the authoritative lifetime count; disk has authoritative
+        # presence — neither alone is reliable across pcap-deletes / wipes.
+        self._captured_bssids |= self._scan_handshake_dir()
 
         # Scan wpa-sec potfile for cracked networks
         self._cracked_bssids = self._scan_cracked_potfile()
@@ -1964,11 +2091,28 @@ class EnvTune(plugins.Plugin):
         # already-captured AP as "lifetime new" the next time we see it.
         if self._lifetime_new_count == 0 and len(self._captured_bssids) > 0:
             self._lifetime_new_count = len(self._captured_bssids)
-            self._lifetime_new_count_prev = self._lifetime_new_count
             logging.info(
                 f'[envtune] First run with existing handshakes — '
                 f'seeding lifetime_new_count from disk '
                 f'({self._lifetime_new_count} unique BSSIDs)')
+
+        # CRITICAL: always sync prev-counters AFTER load+seed so first epoch
+        # computes a clean diff. Without this, with stored count=N the
+        # first-epoch diff would be N-0=N → reward spike → UCB would
+        # incorrectly credit random startup parameters.
+        self._lifetime_new_count_prev = self._lifetime_new_count
+        self._known_aps_count_prev    = len(self._known_aps)
+
+        # Build initial bettercap skip-list from captured + cracked BSSIDs
+        # so the radio stops wasting time on duplicates we already have.
+        for m in self._captured_bssids:
+            fmac = _format_mac_colons(m)
+            if fmac:
+                self._bcap_skip_macs.add(fmac)
+        for m in self._cracked_bssids:
+            fmac = _format_mac_colons(m)
+            if fmac:
+                self._bcap_skip_macs.add(fmac)
 
         # Start async save thread
         self._save_thread = threading.Thread(
@@ -2006,6 +2150,10 @@ class EnvTune(plugins.Plugin):
                     self._bettercap_sync(agent, {param: p[param]})
         except Exception as e:
             logging.debug(f'[envtune] initial bettercap sync: {e}')
+
+        # Push initial captured-BSSID skip list so bettercap deprioritises
+        # duplicates from the very first attack cycle of this session.
+        self._push_bcap_skip_list(agent, force=True)
 
         if self.cfg.get('reset_history', True):
             try:
@@ -2069,8 +2217,9 @@ class EnvTune(plugins.Plugin):
         try:
             ch = _si(channel)
             if ch:
-                self._free_channels.append(ch)
-                self._ch_lt[ch]['free_seen'] += 1
+                with self._state_lock:
+                    self._free_channels.append(ch)
+                    self._ch_lt[ch]['free_seen'] += 1
         except Exception:
             pass
 
@@ -2103,7 +2252,9 @@ class EnvTune(plugins.Plugin):
                 raw_aps = []
                 aps     = 0
 
-            dur_secs     = max(1.0, _sf(epoch_data.get('duration_secs', 60)))
+            # FIX: floor at 10s, not 1s. Very short epochs (e.g. 5s) inflate
+            # hs_per_min unrealistically and corrupt _recent_hpm percentiles.
+            dur_secs     = max(10.0, _sf(epoch_data.get('duration_secs', 60)))
             deauths      = _si(epoch_data.get('num_deauths',          0))
             assocs       = _si(epoch_data.get('num_associations',     0))
             handshakes   = _si(epoch_data.get('num_handshakes',       0))
@@ -2147,12 +2298,19 @@ class EnvTune(plugins.Plugin):
                 self, '_known_aps_count_prev', 0))
             self._known_aps_count_prev = current_ap_count
 
+            # FIX: snapshot _known_aps under lock once per epoch. All later
+            # iterations in on_epoch use the snapshot, avoiding races with
+            # on_wifi_update / on_handshake / on_association mutations.
+            with self._state_lock:
+                aps_items_snap  = list(self._known_aps.items())
+                aps_values_snap = [v for _, v in aps_items_snap]
+
             # "Underlying work" proxy — did we DO things this epoch even
             # if no handshake came out? Assoc/deauth attempts on uncaptured
             # APs (vs wasted on already-captured) count as productive work.
             # Avoids the trap where 0-handshake epochs all look identical.
             uncaptured_attacks = sum(
-                ap.get('AT_attacks', 0) for ap in self._known_aps.values()
+                ap.get('AT_attacks', 0) for ap in aps_values_snap
                 if not ap.get('AT_already_captured', False)
             )
             attack_efficiency_proxy = (
@@ -2192,7 +2350,7 @@ class EnvTune(plugins.Plugin):
             custom_rwd = self._custom_reward(
                 handshakes, hs_rate, missed_rate, native_rwd, dur_secs,
                 lifetime_new_this_epoch, active_ratio, inactive_ratio, hops_ratio,
-                new_aps_seen, attack_efficiency_proxy)
+                new_aps_seen, attack_efficiency_proxy, interactions)
 
             # ── 6. Nexmon crash detection ─────────────────────────────────
             if self._check_nexmon_crash(aps, interactions):
@@ -2221,6 +2379,10 @@ class EnvTune(plugins.Plugin):
                 self._dead_session.clear()
                 self._free_channels.clear()
                 self._ucb_cache.clear()
+                # FIX: stale decisions in the buffer were taken in the
+                # previous environment — attributing rewards from the new
+                # environment to them corrupts UCB stats.
+                self._reset_decision_buffer()
                 logging.info(f'[envtune] location change → '
                              f'{boost}-ep exploration boost')
 
@@ -2320,13 +2482,17 @@ class EnvTune(plugins.Plugin):
             recency_limit = int(self.cfg['client_recency_epochs'])
             total_fresh_clients = sum(
                 ap.get('AT_clients', 0)
-                for ap in self._known_aps.values()
+                for ap in aps_values_snap
                 if (not ap.get('AT_already_captured', False)
                     and ap.get('AT_cooldown_until', 0) <= self.epochs_seen
                     and (self.epochs_seen - ap.get('AT_client_epoch', -99))
                         <= recency_limit)
             )
-            if total_fresh_clients == 0 and interactions >= 3:
+            # FIX: also drop max_interactions in genuinely sparse environments
+            # (few APs total) — interactions threshold alone misses the "small
+            # cafe with 3 strong APs" case where we should still favor PMKID.
+            if (total_fresh_clients == 0
+                    and (interactions >= 3 or aps_ema < 5)):
                 # No clients → focus on PMKID (assoc), reduce deauth aggression
                 chosen['max_interactions'] = min(
                     _si(chosen.get('max_interactions', 3)), 2)
@@ -2335,12 +2501,32 @@ class EnvTune(plugins.Plugin):
                     _si(chosen.get('max_interactions', 3)), 4)
 
             # ── 18. PMF detection ─────────────────────────────────────────
+            # FIX: detection is one-way. Once AT_pmf_detected=True we never
+            # try that AP again, but firmware/client-cap can change.
+            # Re-evaluate every 200 epochs after detection: if a fresh
+            # client appears AND we are well within range, allow one more
+            # attempt by clearing the flag (and resetting attack counter).
             pmf_thr = int(self.cfg['pmf_attack_threshold'])
-            for apID, ap in self._known_aps.items():
+            for apID, ap in aps_items_snap:
                 if (ap.get('AT_attacks', 0) >= pmf_thr
                         and ap.get('AT_handshake', 0) == 0
                         and _sf(ap.get('rssi', -85)) > -72):
                     ap['AT_pmf_detected'] = True
+                    ap['AT_pmf_detected_ep'] = self.epochs_seen
+                elif ap.get('AT_pmf_detected', False):
+                    pmf_ep   = ap.get('AT_pmf_detected_ep', 0)
+                    age      = self.epochs_seen - pmf_ep
+                    has_fresh = (
+                        ap.get('AT_clients', 0) > 0
+                        and (self.epochs_seen
+                             - ap.get('AT_client_epoch', -99))
+                            <= recency_limit)
+                    if (age >= 200
+                            and has_fresh
+                            and _sf(ap.get('rssi', -85)) > -65):
+                        ap['AT_pmf_detected'] = False
+                        ap['AT_attacks']      = 0
+                        ap['AT_missed']       = 0
 
             # ── 19. Sanity check parameter coupling ───────────────────────
             chosen = self._sanity_check(chosen)
@@ -2363,7 +2549,7 @@ class EnvTune(plugins.Plugin):
             cd_short  = int(self.cfg['ap_cooldown_short'])
             cd_long   = int(self.cfg['ap_cooldown_long'])
             miss_cd   = int(self.cfg['missed_cooldown_threshold'])
-            for apID, ap in self._known_aps.items():
+            for apID, ap in aps_items_snap:
                 atk = ap.get('AT_attacks', 0)
                 hs  = ap.get('AT_handshake', 0)
                 ap['AT_efficiency'] = hs / atk if atk > 0 else 0.0
@@ -2394,11 +2580,16 @@ class EnvTune(plugins.Plugin):
 
             # ── 22. Channel wasted-attack tracking ────────────────────────
             if interactions > 0 and handshakes == 0:
-                for ch in self._active_channels:
-                    self._ch_lt[ch]['wasted'] += 1
+                with self._state_lock:
+                    for ch in self._active_channels:
+                        self._ch_lt[ch]['wasted'] += 1
 
             # ── 23. Channel scheduling ────────────────────────────────────
             self._schedule_channels(agent)
+
+            # FIX: push grown skip-list to bettercap so wifi.assoc/deauth
+            # don't waste airtime on already-captured BSSIDs.
+            self._push_bcap_skip_list(agent)
 
             # ── 24. Proactive attacks for high-value targets (opt-in) ─────
             if (self._profile['enable_proactive']
@@ -2450,29 +2641,51 @@ class EnvTune(plugins.Plugin):
           - Not already captured (would be wasted reward)
           - Not in cooldown (we already tried recently)
           - Not PMF-detected (waste of breath)
-          - Hostname is not hidden (no SSID = PMKID assoc useless)
+          - Not in wpa-sec cracked set (we know the password)
+          - Hidden hostname: only with strict RSSI+clients gate
           - Strong enough RSSI
+          - MAC validates as real (not a malformed bcap entry)
         """
         try:
-            best_ap   = None
+            # FIX: snapshot under lock to avoid race with on_wifi_update.
+            with self._state_lock:
+                aps_snap     = list(self._known_aps.items())
+                cracked_snap = set(self._cracked_bssids)
+
+            best_ap    = None
             best_score = 0.0
-            for apID, ap in self._known_aps.items():
+            for apID, ap in aps_snap:
                 if ap.get('AT_already_captured', False):
                     continue
                 if ap.get('AT_cooldown_until', 0) > self.epochs_seen:
                     continue
                 if ap.get('AT_pmf_detected', False):
                     continue
-                # Hidden APs: skip proactive PMKID attack.
-                # Without an SSID we can't usefully complete the auth
-                # exchange, and pwnagotchi's main loop will pick them up
-                # via deauth-of-clients anyway.
-                hostname = str(ap.get('hostname', '')).strip()
-                if not hostname or hostname == '<hidden>' or apID.startswith('hidden-'):
+                # FIX: skip APs whose password we already cracked via wpa-sec.
+                # No reward for re-capturing networks we've already broken.
+                mac_n = self._mac_norm(ap.get('mac', ''))
+                if mac_n and mac_n in cracked_snap:
                     continue
                 rssi    = _sf(ap.get('rssi', -85))
                 clients = ap.get('AT_clients', 0)
+                # FIX: hidden APs aren't useless for PMKID — bettercap can
+                # still elicit an assoc frame. Allow them, but require a
+                # stronger gate: very close RSSI AND active clients.
+                hostname = str(ap.get('hostname', '')).strip()
+                is_hidden = (
+                    not hostname
+                    or hostname == '<hidden>'
+                    or apID.startswith('hidden-'))
+                if is_hidden:
+                    if rssi < -60 or clients == 0:
+                        continue
                 if rssi < self.cfg['proactive_min_rssi']:
+                    continue
+                # FIX: validate MAC syntactically before sending to bcap —
+                # malformed entries would cause the agent.run command to
+                # silently fail or, worse, parse wrong.
+                mac = ap.get('mac', '')
+                if not _is_valid_mac(mac):
                     continue
                 # Score: rssi + client count
                 score = (rssi + 90) + clients * 5
@@ -2483,8 +2696,6 @@ class EnvTune(plugins.Plugin):
             if best_ap is None:
                 return
             mac = best_ap.get('mac')
-            if not mac:
-                return
             # Proactive PMKID grab via wifi.assoc — bettercap sends an
             # association frame, AP may leak PMKID without needing a client.
             # We do NOT do proactive deauth here: deauth requires a client
@@ -2492,6 +2703,9 @@ class EnvTune(plugins.Plugin):
             # bettercap's main loop handles better than we can.
             agent.run('wifi.assoc %s' % mac)
             self._last_proactive_ep = self.epochs_seen
+            with self._state_lock:
+                if best_ap is self._known_aps.get(self._ap_id(best_ap)):
+                    best_ap['AT_lastattack_ep'] = self.epochs_seen
             logging.debug(f'[envtune] proactive assoc → {mac}')
         except Exception as e:
             logging.debug(f'[envtune] proactive: {e}')
@@ -2538,6 +2752,12 @@ class EnvTune(plugins.Plugin):
                 if mac_n:
                     self._captured_bssids.add(mac_n)
                     self._session_hs_bssids.add(mac_n)
+                    # FIX: feed bettercap skip-list so duplicate captures
+                    # are pre-empted in the next epoch's sync. Coalesced
+                    # via _push_bcap_skip_list (only sends when set grows).
+                    colon_mac = _format_mac_colons(mac_n)
+                    if colon_mac:
+                        self._bcap_skip_macs.add(colon_mac)
                 if apID:
                     self._captured_aps.add(apID)
                 if ch:
@@ -2575,13 +2795,14 @@ class EnvTune(plugins.Plugin):
         try:
             ch   = _si(access_point.get('channel', 0))
             apID = self._ap_id(access_point)
-            self._inc_ch('Associations', ch)
-            self._ch_lt[ch]['assocs'] += 1
             self._mark_ap_seen(access_point, 'assoc')
             with self._state_lock:
+                self._inc_ch('Associations', ch)
+                self._ch_lt[ch]['assocs'] += 1
                 if apID in self._known_aps:
                     ap = self._known_aps[apID]
                     ap['AT_attacks'] = ap.get('AT_attacks', 0) + 1
+                    ap['AT_lastattack_ep'] = self.epochs_seen
         except Exception as e:
             logging.debug(f'[envtune] on_association: {e}')
 
@@ -2589,50 +2810,62 @@ class EnvTune(plugins.Plugin):
         try:
             ch   = _si(access_point.get('channel', 0))
             apID = self._ap_id(access_point)
-            self._inc_ch('Deauths', ch)
-            self._ch_lt[ch]['deauths'] += 1
             self._mark_ap_seen(access_point, 'deauth')
             with self._state_lock:
+                self._inc_ch('Deauths', ch)
+                self._ch_lt[ch]['deauths'] += 1
                 if apID in self._known_aps:
                     ap = self._known_aps[apID]
                     ap['AT_attacks'] = ap.get('AT_attacks', 0) + 1
+                    ap['AT_lastattack_ep'] = self.epochs_seen
         except Exception as e:
             logging.debug(f'[envtune] on_deauthentication: {e}')
 
     def on_wifi_update(self, agent, access_points):
         try:
+            # FIX: 'Current APs' counter must be decremented symmetrically
+            # when an AP transitions visible→invisible. Previously we set
+            # AT_visible=False without dec'ing the channel counter.
+            # FIX: snapshot _known_aps via list() to avoid 'dict changed size'
+            # under RLock re-entry from _mark_ap_seen / evict.
+            # FIX: all _ch_lt, _unscanned_channels, _dead_session, _dead_lt
+            # mutations now under a single lock — these are concurrently
+            # read by _schedule_channels and _ch_score from on_epoch.
             with self._state_lock:
-                # Mark all known APs as invisible; visible ones re-mark below
-                for ap in self._known_aps.values():
+                for ap in list(self._known_aps.values()):
+                    if ap.get('AT_visible', False):
+                        ap_ch = _si(ap.get('channel', 0))
+                        if ap_ch:
+                            self._inc_ch('Current APs', ap_ch, -1)
                     ap['AT_visible'] = False
 
-            active      = []
-            visited_chs = set()
-            for ap in access_points:
-                if self._is_whitelisted(ap):
-                    continue
-                self._mark_ap_seen(ap, 'wifi_update')
-                ch = _si(ap.get('channel', 0))
-                if ch <= 0:
-                    continue
-                if ch not in active:
-                    active.append(ch)
-                    if ch in self._unscanned_channels:
-                        self._unscanned_channels.remove(ch)
-                    self._dead_session[ch] = 0
-                if ch not in visited_chs:
-                    self._ch_lt[ch]['visits'] += 1
-                    visited_chs.add(ch)
+                active      = []
+                visited_chs = set()
+                for ap in access_points:
+                    if self._is_whitelisted(ap):
+                        continue
+                    self._mark_ap_seen(ap, 'wifi_update')
+                    ch = _si(ap.get('channel', 0))
+                    if ch <= 0:
+                        continue
+                    if ch not in active:
+                        active.append(ch)
+                        if ch in self._unscanned_channels:
+                            self._unscanned_channels.remove(ch)
+                        self._dead_session[ch] = 0
+                    if ch not in visited_chs:
+                        self._ch_lt[ch]['visits'] += 1
+                        visited_chs.add(ch)
 
-            # Dead-channel session counter
-            for ch in list(self._dead_session):
-                if ch not in active:
-                    self._dead_session[ch] += 1
-                    if (self._dead_session[ch]
-                            > int(self.cfg['dead_channel_cooldown']) * 4):
-                        self._dead_lt[ch] = self._dead_lt.get(ch, 0) + 1
+                # Dead-channel session counter
+                for ch in list(self._dead_session):
+                    if ch not in active:
+                        self._dead_session[ch] += 1
+                        if (self._dead_session[ch]
+                                > int(self.cfg['dead_channel_cooldown']) * 4):
+                            self._dead_lt[ch] = self._dead_lt.get(ch, 0) + 1
 
-            self._active_channels = active
+                self._active_channels = active
         except Exception as e:
             logging.exception(f'[envtune] on_wifi_update: {e}')
 
@@ -2662,10 +2895,10 @@ class EnvTune(plugins.Plugin):
             ch   = _si(ap.get('channel', 0))
             if not ch:
                 return
-            self._inc_ch('Clients', ch)
-            self._ch_lt[ch]['clients'] += 1
             apID = self._ap_id(ap)
             with self._state_lock:
+                self._inc_ch('Clients', ch)
+                self._ch_lt[ch]['clients'] += 1
                 if apID in self._known_aps:
                     self._known_aps[apID]['AT_clients'] = (
                         self._known_aps[apID].get('AT_clients', 0) + 1)
@@ -2850,7 +3083,7 @@ small{font-size:0.78em;color:#666}
              'Handshakes per minute (smoothed)'),
             ('Adaptive HPM target',
              self._fmt(self._adaptive_hpm_target()),
-             '75th-percentile of recent hs/min — reward target'),
+             '90th-percentile of recent unique-HS/min — reward target'),
             ('Reward trend',       self._fmt(self._reward_trend),
              'Direction of recent reward EMA'),
             ('Best custom reward', self._fmt(self.best_reward),
@@ -2939,10 +3172,13 @@ small{font-size:0.78em;color:#666}
                 '<th>Cracked</th><th>Assocs</th><th>Deauths</th>'
                 '<th>Clients</th><th>Visits</th><th>Wasted</th>'
                 '<th>Free</th><th>Dead⚡</th><th>Score</th></tr>')
-        chs = sorted(self._ch_lt.keys(),
-                     key=lambda c: -self._ch_lt[c]['hs'])[:25]
+        # FIX: snapshot under lock — UI reads concurrently with event handlers.
+        with self._state_lock:
+            ch_lt_snap = {c: dict(v) for c, v in self._ch_lt.items()}
+        chs = sorted(ch_lt_snap.keys(),
+                     key=lambda c: -ch_lt_snap[c]['hs'])[:25]
         for ch in chs:
-            d   = self._ch_lt[ch]
+            d   = ch_lt_snap[ch]
             sc  = self._ch_score(ch)
             nol = '🔵' if ch in self.NON_OVERLAPPING else ''
             fr  = '✨' if ch in self._free_channels else ''
@@ -3094,3 +3330,4 @@ small{font-size:0.78em;color:#666}
         except Exception as e:
             return (f'Error: {html.escape(str(e))}', 500,
                     {'Content-Type': 'text/plain'})
+
