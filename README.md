@@ -1,99 +1,362 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Pwnagotchi-Plugin-ff69b4?style=for-the-badge&logo=raspberry-pi&logoColor=white" alt="Pwnagotchi Plugin" />
-  <img src="https://img.shields.io/badge/Version-3.0.0-blue?style=for-the-badge" alt="Version 3.0.0" />
-  <img src="https://img.shields.io/badge/Author-adi1708-orange?style=for-the-badge" alt="Author adi1708" />
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="MIT License" />
-</p>
+# EnvTune
 
-<h1 align="center">🎛️ EnvTune A hybrid between envtune and auto tune</h1>
+**Adaptive Environment Tuner for Pwnagotchi — drop-in replacement for the removed AI.**
 
-> **An advanced, environment-aware personality tuner for Pwnagotchi.**
-> **A hybrid between envtune and auto tune**
-> 
-> EnvTune actively monitors your surroundings and dynamically adjusts your Pwnagotchi's core parameters (`min_rssi`, `hop_recon_time`, `recon_time`, and `max_interactions`) to optimize handshake capture rates and maximize rewards.
+Maximises *unique* (lifetime-new) BSSID handshake captures by learning optimal `personality` parameters for each environment using **Sliding-Window UCB1 with empirical-Bayes shrinkage**. Built specifically for the [jayofelony/pwnagotchi](https://github.com/jayofelony/pwnagotchi) `noai` branch.
+
+- ≈ 2-3 % CPU on a Pi Zero 2 W
+- No neural net → cannot crash the WiFi firmware
+- Stdlib only (no extra `pip` packages)
+- State persists across reboots and plugin upgrades
 
 ---
 
-## ✨ Key Features
+## Why this exists
 
-* 📈 **EMA Smoothing:** Uses Exponential Moving Average to smooth out spikes in access point (AP) density, handshake rates, and rewards. This prevents your Pwnagotchi from overreacting to brief changes in the environment.
-* 💾 **State Persistence:** Saves lifetime handshakes, top channels, and best-performing settings to disk. Your Pwnagotchi learns and remembers its optimal configurations across reboots!
-* 🧠 **Best-Settings Memory:** Once EnvTune finds a configuration that yields high rewards, it actively biases future adjustments toward those proven "best" settings.
-* ⏪ **Reward-Revert:** If a recent parameter adjustment causes the reward score to drop significantly, EnvTune automatically detects this and rolls back to the previous stable settings.
-* 🙈 **Blind-Panic Mode:** If your Pwnagotchi sees nothing for a specified number of epochs, EnvTune safely resets parameters to highly permissive defaults to help it regain its bearings.
-* 🏙️ **Density Adaptation:** Automatically tightens parameters in crowded areas to focus on high-quality targets, while relaxing them in sparse environments to cast a wider net.
+Jay removed the A2C neural network because it destabilised the WiFi firmware and drained batteries. The stock `noai` build is solid but runs on **fixed parameters** — it cannot adapt to your routes, times, or environments. EnvTune fills that gap with lightweight, predictable ML that **only ever tunes parameters pwnagotchi already supports**.
+
+The optimisation target is unambiguous: **the count of BSSIDs you have NEVER captured before, ever, across all sessions.** Catching the same network ten times yields the same reward as catching it once. Brand-new captures earn full reward.
 
 ---
 
-## 🛠️ Installation
+## How it works (in 60 seconds)
 
-**1. Connect to your Pwnagotchi via SSH:**
-```bash
-ssh pi@(name of your pwnaogtchi).local
-```
+1. Each epoch, EnvTune classifies the current environment into one of **108 contexts** (AP density × time-of-day × reward trend × mobility).
+2. For each of **14 personality parameters**, a Sliding-Window UCB1 bandit picks a value ("arm") for the current context. **Empirical-Bayes shrinkage** pulls every cell toward its parent group (states sharing 2+ context dims) with weight `n / (n+5)`, so cold or rare contexts inherit useful priors instead of starting blind.
+3. Reward is computed `reward_delay` epochs later (default 3, **adaptive**: −1 in dense areas, +1 in sparse).
+4. The reward signal uses Hill-style saturation `r = ratio / (ratio + 1)` so a target-hit clearly outranks the cold-start prior — UCB can actually distinguish "did nothing" from "did well" from "knocked it out of the park".
+5. Channels are scheduled by combined lifetime productivity + live uncaptured-AP opportunity + a **per-channel efficiency multiplier** (low-yield channels are deprioritised even if they have many APs). Already-captured BSSIDs are pushed to bettercap's `wifi.assoc.skip` / `wifi.deauth.skip` so no airtime is wasted on duplicates.
 
-**2. Download the plugin:**
-Download `envtune.py` and place it in your custom plugins directory (default is usually `/usr/local/share/pwnagotchi/custom-plugins/`).
-```bash
-wget https://raw.githubusercontent.com/adi170-alt/envtune/main/envtune.py -O /usr/local/share/pwnagotchi/custom-plugins/envtune.py
-```
+After ~150–250 epochs in a given environment the plugin starts consistently picking the right parameters. The sliding window means stale memory never overrides fresh evidence.
 
-**3. Enable the plugin in your config:**
-Open your configuration file:
-```bash
-sudo nano /etc/pwnagotchi/config.toml
-```
-Add the following line to enable it:
+---
+
+## Key capabilities
+
+### Learning
+- **14-parameter SW-UCB1** with annealed exploration constant
+- **Empirical-Bayes shrinkage** — every UCB cell blends local mean with parent-group mean, killing the cold-start tax across 108-state space
+- **Hierarchical priors** so rare contexts benefit from common ones
+- **Time-of-day priors** seed reasonable defaults instantly on first install
+- **Saturation-aware exploration boost** — when >80 % of visible non-cracked APs are already captured, exploration is widened so the bandit re-tests in a different direction
+
+### Targeting
+- **Fresh-session BSSID priority** — a brand-new BSSID gets a +1.5 priority bonus that decays linearly over 8 epochs
+- **Client-aware deauth windows** — clients seen ≤1 epoch ago stack an extra +2.0 per client
+- **Per-AP cooldown** on persistent non-responders + tier-based AP eviction (cracked-captured first, fresh-untried last)
+- **PMF detection** with 200-epoch re-evaluation
+- **Already-captured detection** from `/root/handshakes/` + persisted state, with **immediate** skip-list push on handshake (not next epoch)
+- **wpa-sec cracked feedback** — skips already-cracked networks; periodic potfile rescan every 100 epochs
+- **Whitelist respect** — whitelisted APs never enter UCB statistics
+- **Handshake-dir watchdog** — every 200 epochs the handshake directory is rescanned to catch externally-added pcaps
+
+### Channels
+- **Lifetime + live opportunity scoring** — historical productivity weighted with currently-visible uncaptured APs
+- **Per-channel efficiency multiplier** (0.5×–1.5×) — telemetry showed low-yield channels were over-visited; this rebalances toward channels that actually convert
+- **5 GHz-aware recon timing** — when >30 % of visible APs are 5 GHz, recon shrinks to compensate for slower band scans
+- **Free-channel opportunism** via `on_free_channel` callback
+- **Dead-channel cooldown** with automatic recovery
+
+### Spatial / temporal
+- **GPS zone-aware learning** — auto-detects TheyLive or stock `gps`, no config required
+- **Zone-keyed channel histogram** (HS-keyed, not visit-keyed) — re-entering a known zone immediately favours the channels that produced handshakes there
+- **Stationary vs mobile detection** via speed and AP turnover; UCB priors adjust automatically
+- **GPS zone LRU cap (500)** so very long deployments never balloon the state file
+- **Heatmap of captures** with per-zone productivity scoring
+
+### Safety
+- **Thermal safety** — backs off at 70 °C, hard-throttles at 78 °C
+- **Nexmon crash detection** + automatic backoff (won't fight a wedged firmware)
+- **Blind-panic state machine** — radio sees nothing → forces aggressive scan params, throttles preserved (no double-throttle erasure)
+- **EMA input clamps** — every smoothed metric has sane bounds, so a single rogue native-reward sample can't poison the EMA forever (we observed `reward = -8.5e15` in real telemetry; this safeguard prevents a recurrence)
+
+### Operations
+- **Async state save** — no SD-card stalls mid-epoch
+- **Atomic writes** via `tempfile` + `os.replace` + `fsync`
+- **Versioned + migrated state** — survives plugin upgrades, schema bumps cleanly
+- **Five CPU profiles** — `minimal`, `light`, `balanced`, `aggressive`, `beast`
+- **PiSugar awareness** (optional, graceful)
+
+### Web UI
+- **Modern dashboard** at `/plugins/envtune/`
+- **Five operator actions** (force-save, rescan-potfile, reset-stagnation, reload-whitelist, clear-blind) — each protected with a per-process CSRF token, all relative URLs anchored via `<base href="…">` so they work whether you visited the page with or without a trailing slash
+- **25 Prometheus counters** for Grafana dashboards
+- **All dynamic values HTML-escaped** — attacker-controlled SSIDs cannot inject markup or trigger Jinja evaluation
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| Pwnagotchi | jayofelony/pwnagotchi (noai branch) |
+| Python     | 3.7+ (already in the stock image) |
+| Extra deps | none |
+
+---
+
+## Installation
+
+1. Copy `envtune.py` to:
+   ```
+   /usr/local/share/pwnagotchi/custom-plugins/envtune.py
+   ```
+
+2. Add to `/etc/pwnagotchi/config.toml`:
+   ```toml
+   main.plugins.envtune.enabled = true
+   ```
+
+3. *(Optional)* Pick a CPU profile for your hardware:
+   ```toml
+   main.plugins.envtune.cpu_profile = "balanced"
+   # choices: minimal | light | balanced | aggressive | beast
+   # default: auto-detected from /proc/cpuinfo
+   ```
+
+4. *(Optional)* Turn off stock `auto_tune` if you used it — EnvTune replaces it.
+
+5. Reboot. First **5 epochs = warmup** (observation only). After ~**150–250 epochs** you should see consistent gains in unique captures per session.
+
+GPS and PiSugar are auto-detected — no extra config.
+
+---
+
+## CPU profiles
+
+| Profile     | UCB window | Zone res | AP track cap | Extra ch | Proactive | Recommended HW |
+|-------------|------------|----------|--------------|----------|-----------|----------------|
+| minimal     | 20         | 300 m    | 150          | 2        | off       | very weak / battery saver |
+| light       | 30         | 200 m    | 250          | 3        | off       | Pi Zero |
+| balanced    | 40         | 150 m    | 400          | 3        | on        | Pi Zero 2 W, Pi 3 |
+| aggressive  | 60         | 100 m    | 600          | 4        | on        | Pi 4 |
+| beast       | 80         | 75 m     | 1000         | 5        | on        | Pi 5 |
+
+---
+
+## Config recipes
+
+**Aggressive wardriving:**
 ```toml
-main.plugins.envtune.enabled = true
+main.plugins.envtune.cpu_profile     = "aggressive"
+main.plugins.envtune.temp_critical   = 80.0
+main.plugins.envtune.extra_channels  = 5
 ```
 
-**4. Restart the service:**
-```bash
-sudo systemctl restart pwnagotchi
-```
-
----
-
-## ⚙️ Configuration (Optional)
-
-EnvTune works exceptionally well out of the box using its built-in defaults. However, power users can fine-tune its behavior by adding the following parameters to `config.toml`. 
-
-Here are the default values and what they do:
-
+**Stealthy home use:**
 ```toml
-# Smoothing factor for EMA (lower = slower reaction to changes)
-main.plugins.envtune.ema_alpha = 0.35
-
-# Epochs to wait before EnvTune starts adjusting parameters
-main.plugins.envtune.warmup_epochs = 3
-
-# Handshake rate thresholds for tuning hop speeds
-main.plugins.envtune.hs_rate_low = 0.15
-main.plugins.envtune.hs_rate_high = 0.40
-
-# Access point thresholds for environment density 
-main.plugins.envtune.dense_aps = 25
-main.plugins.envtune.sparse_aps = 8
-
-# Epochs of zero visibility before triggering a permissive reset
-main.plugins.envtune.blind_panic_epochs = 3
-
-# How much the reward must drop to trigger a settings rollback
-main.plugins.envtune.reward_drop_threshold = 0.25
-
-# How frequently (in epochs) to save the state to disk
-main.plugins.envtune.save_every_n_epochs = 5
-
-# How heavily to bias new adjustments toward historically best settings (0.0 to 1.0)
-main.plugins.envtune.best_bias_weight = 0.15
+main.plugins.envtune.cpu_profile             = "light"
+main.plugins.envtune.ucb_c                   = 1.0
+main.plugins.envtune.opportunistic_overrides = false
 ```
+
+**Max learning on strong hardware:**
+```toml
+main.plugins.envtune.cpu_profile         = "beast"
+main.plugins.envtune.ucb_window          = 80
+main.plugins.envtune.save_every_n_epochs = 10
+```
+
+**Reduce shrinkage if you trust per-state data more:**
+```toml
+main.plugins.envtune.ucb_shrinkage_k = 2.0   # default 5.0
+```
+
+**Frequent disk rescans (busy environments):**
+```toml
+main.plugins.envtune.potfile_rescan_every_n   = 50    # default 100
+main.plugins.envtune.handshake_rescan_every_n = 100   # default 200
+```
+
+All `DEFAULTS` keys can be overridden under `main.plugins.envtune.<key>`.
 
 ---
 
-## 📂 Under the Hood: The State File
+## Tuned parameters (UCB arms)
 
-EnvTune automatically generates a state file located at:
-`/etc/pwnagotchi/envtune_state.json`
+| Parameter                     | Arms                          |
+|-------------------------------|-------------------------------|
+| `min_rssi`                    | -85, -80, -75, -70, -65       |
+| `hop_recon_time`              | 4, 6, 8, 10, 12, 15           |
+| `min_recon_time`              | 2, 3, 5, 7, 10                |
+| `recon_time`                  | 15, 20, 25, 30, 35, 45        |
+| `max_interactions`            | 2, 3, 4, 5, 6                 |
+| `ap_ttl`                      | 60, 120, 180, 300, 600        |
+| `sta_ttl`                     | 120, 300, 600, 900            |
+| `max_misses_for_recon`        | 3, 5, 7, 10                   |
+| `max_inactive_scale`          | 2, 3, 5                       |
+| `recon_inactive_multiplier`   | 1, 2, 3                       |
+| `throttle_a`                  | 0.2, 0.4, 0.6, 0.8, 1.0       |
+| `throttle_d`                  | 0.3, 0.5, 0.7, 0.9, 1.2       |
+| `bored_num_epochs`            | 10, 15, 20, 25                |
+| `sad_num_epochs`              | 15, 20, 25, 30                |
 
-**You do not need to manually edit this file.** It is securely used by the plugin to log your Pwnagotchi's lifetime handshakes, channel statistics, and the best configuration parameters it has discovered over time.
+Hard `BOUNDS` clamp every value during panic / thermal modes — UCB never exits the safe envelope.
+
+---
+
+## Reward function
+
+```
+r =  0.60 · lifetime-new HS / min     (primary objective, Hill-saturated)
+   + 0.10 · new APs discovered        (exploration value)
+   + 0.08 · unique-per-attack         (duplicates don't help)
+   + 0.06 · 1 - missed_rate           (efficiency)
+   + 0.05 · active_ratio              (we're working)
+   + 0.04 · hop diversity             (coverage)
+   + 0.03 · native pwnagotchi reward  (loose alignment)
+   + 0.04 · "underlying work" proxy   (avoids 0-HS deadzones)
+   - 0.05 · inactive_ratio            (penalty for stalls)
+   - 0.07 · blind_ratio               (penalty for radio sees nothing)
+   - 0.04 · sad_for_epochs / total    (mood penalty, gated ≥5 epochs)
+   - 0.03 · bored_for_epochs / total  (mood penalty, gated ≥5 epochs)
+```
+
+Plus an **activity floor of 0.01** when there were any interactions but zero new captures, so UCB still distinguishes "tried something but failed" from "did nothing at all".
+
+The primary term uses Hill saturation:
+
+```
+new_term = ratio / (ratio + 1)
+```
+
+with `ratio = (lifetime-new captures / min) / target`. Target is the **90th percentile** of recent unique-HS-per-min — only the very best epochs raise the bar. This gives:
+
+| ratio       | new_term | weighted contribution |
+|-------------|----------|-----------------------|
+| 0.00        | 0.000    | 0.000                 |
+| 0.50        | 0.333    | 0.200                 |
+| 1.00 (target) | 0.500  | 0.300                 |
+| 2.00        | 0.667    | 0.400                 |
+| 4.00        | 0.800    | 0.480                 |
+| 8.00        | 0.889    | 0.533                 |
+
+A target-hit weighted contribution of 0.30 sits cleanly above the 0.30 cold-start UCB prior, so the bandit can actually rank arms.
+
+Reward components are stashed in a per-epoch breakdown dict for debug logging.
+
+---
+
+## Web UI
+
+```
+http://<pwnagotchi-ip>:8080/plugins/envtune/
+```
+
+Live stats, the full UCB learning table, channel productivity, AP intelligence, GPS zones, thermal/battery status. Hover any value for an explanation. Five buttons run operator actions; each requires a CSRF token bound to the running plugin process.
+
+### Endpoints
+
+| Path                       | Method | Returns                      |
+|----------------------------|--------|------------------------------|
+| `/plugins/envtune/`        | GET    | Dashboard (HTML)             |
+| `/plugins/envtune/export`  | GET    | Full state (JSON)            |
+| `/plugins/envtune/metrics` | GET    | Prometheus-style metrics (25 counters) |
+| `/plugins/envtune/zones`   | GET    | Per-zone productivity (JSON) |
+
+### Operator actions (POST, CSRF-protected)
+
+| Action               | Purpose                                                  |
+|----------------------|----------------------------------------------------------|
+| `force-save`         | Flush plugin state JSON to disk now                      |
+| `rescan-potfile`     | Re-read `/root/handshakes/wpa-sec.cracked.potfile`       |
+| `reset-stagnation`   | Clear stagnation streak & decision buffer; re-explore    |
+| `reload-whitelist`   | Reload `main.whitelist` and handshake list from config   |
+| `clear-blind`        | Drop blind-recovery counter to zero                      |
+
+The dashboard emits an absolute mount-point in the `<base href>` and on every form action so the buttons keep working whether you reach the dashboard with or without a trailing slash.
+
+---
+
+## State & persistence
+
+- State file: `/etc/pwnagotchi/envtune_state.json`
+- Atomic writes via `tempfile` + `os.replace` + `fsync`
+- Async save thread coalesces rapid requests — no SD-card stall mid-epoch
+- Schema-versioned (`STATE_SCHEMA_VERSION`); migrates older saves on load
+- **EMA values are sanitised on load** — out-of-range values from older versions (or one-off bad samples) are dropped and re-seeded on the next epoch
+- Persisted: EMAs, lifetime totals, captured + cracked BSSID sets, channel lifetime stats, dead-channel ledger, GPS zones, UCB Q-tables, best-known reward + settings
+
+---
+
+## Comparison with predecessors
+
+| | stock auto_tune | original A2C AI | **EnvTune v1.1** |
+|---|---|---|---|
+| Learning algorithm                  | none (manual UI)        | A2C neural net | SW-UCB1 + Bayesian shrinkage |
+| Adaptive to context                 | no                      | yes            | yes (108 contexts)           |
+| Risk to WiFi firmware               | none                    | high (removed) | none (no channel-toggling)   |
+| CPU footprint                       | tiny                    | high           | tiny (~2-3 % Pi 0 2 W)       |
+| Survives reboot                     | manual presets only     | no             | yes (atomic + schema-migrated) |
+| Anti-overcapture                    | none                    | partial        | bettercap-skip + per-AP cooldown + tier eviction |
+| Fresh-target priority               | none                    | none           | yes (decaying 8-epoch boost) |
+| Channel-efficiency feedback         | none                    | none           | yes (multiplier on lifetime score) |
+| GPS-zone learning                   | none                    | none           | yes (HS-keyed channel histogram) |
+| Web UI                              | parameter editor        | none           | dashboard + 5 CSRF-protected actions |
+| Optimises specifically for unique HS| no                      | partly         | yes (60 % weight on lifetime-new/min) |
+
+---
+
+## Troubleshooting
+
+**"Parameters never change"**
+First 5 epochs are warmup (observation). After that, UCB only changes a parameter when its current arm has been outperformed in the current context. With sparse data this can take dozens of epochs — that's by design (avoid thrashing). Shrinkage helps cold contexts converge faster but doesn't eliminate this entirely.
+
+**"Plugin uses too much CPU"**
+Drop to `cpu_profile = "light"` or `"minimal"`. The big knob is `ucb_window` × `ap_track_max`.
+
+**"State file looks wrong / I want a fresh start"**
+Stop pwnagotchi, remove `/etc/pwnagotchi/envtune_state.json`, restart. The captured-BSSID set is rebuilt from `/root/handshakes/` on next load.
+
+**"Logs full of `nexmon crash suspected`"**
+Driver instability. EnvTune backs off automatically; if it persists, lower `extra_channels` and `max_interactions`.
+
+**"Web UI buttons go to /plugins/<wrong-name>"**
+Fixed in 1.1.0 — earlier versions used relative form actions which broke when the dashboard was visited without a trailing slash. Upgrade.
+
+**"reward EMA shows nonsense like -8e15"**
+Fixed in 1.1.0 — input/output of the EMA are now clamped per-key, and the load path drops corrupt persisted values. The next epoch re-seeds cleanly.
+
+---
+
+## Versions
+
+**v1.1.0**
+- Empirical-Bayes shrinkage in UCB pick (n/(n+5) blend with parent-group mean) — drastically faster convergence in the 108-state × 14-arm space
+- Hill-saturated reward gradient — UCB can finally distinguish target-hit from cold-start prior
+- Per-channel efficiency multiplier (0.5×–1.5×)
+- Fresh-session BSSID priority bonus (1.5 → 0 over 8 epochs)
+- Two new UCB arms: `bored_num_epochs`, `sad_num_epochs`
+- Reward gains explicit blind / sad / bored penalties + activity floor
+- 25-counter Prometheus endpoint
+- Five POST actions with CSRF
+- 5 GHz-aware recon time
+- Saturation-aware exploration boost
+- Handshake-dir + potfile periodic rescans
+- EMA input/output clamps + load-time sanitisation (kills the `reward = -8e15` regression)
+- Web UI base-href + absolute action paths (fixes the `/plugins/<wrong-prefix>` button bug)
+- Tier-based AP eviction; GPS zone LRU cap (500)
+- Adaptive `reward_delay` based on AP density
+- Immediate bettercap skip-list push on every handshake
+- Reward-component breakdown for debug logs
+
+**v1.0.0**
+- Initial release: SW-UCB1, hierarchical priors, GPS zones, thermal safety, web UI, async state save.
+
+---
+
+## Credits
+
+Built on prior art by:
+
+- [@evilsocket](https://github.com/evilsocket) — original pwnagotchi
+- [@jayofelony](https://github.com/jayofelony) — noai fork
+- [@Sniffleupagus](https://github.com/Sniffleupagus) — `auto_tune` plugin
+- [@rai68](https://github.com/rai68) + [@AlienMajik](https://github.com/AlienMajik) — TheyLive GPS plugin
+- @adi1708 — earlier `envtune` iterations
+
+---
+
+## License
+
+MIT
