@@ -3,9 +3,9 @@
 """
 envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
 =========================================================
-Version   : 1.0.0
+Version   : 1.1.0
 License   : MIT
-Repository: https://github.com/  (add yours)
+Repository: https://github.com/adi170-alt/envtune
 
 A drop-in replacement for the removed pwnagotchi AI, built specifically
 for jayofelony/pwnagotchi (noai branch). Uses Sliding-Window UCB1 — a
@@ -113,9 +113,10 @@ Built on top of prior art by:
   • @jayofelony   — noai fork
   • @Sniffleupagus — auto_tune plugin
   • @rai68 + @AlienMajik — TheyLive GPS plugin
-  • @hasj        — earlier envtune iterations
+  • @adi1708(⌐■_■)        — earlier envtune iterations
 """
 
+import hmac
 import html
 import json
 import logging
@@ -123,6 +124,7 @@ import math
 import os
 import queue
 import random
+import secrets
 import tempfile
 import threading
 import time
@@ -130,7 +132,7 @@ from collections import defaultdict, deque
 
 import pwnagotchi.plugins as plugins
 import pwnagotchi.utils
-from flask import abort, render_template_string
+from flask import make_response
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -261,7 +263,7 @@ HW_DEFAULT_PROFILE = {
 
 class EnvTune(plugins.Plugin):
     __author__      = 'adi1708'
-    __version__     = '1.0.0'
+    __version__     = '1.1.0'
     __license__     = 'MIT'
     __description__ = ('Adaptive environment tuner — drop-in replacement '
                        'for the removed pwnagotchi AI. Learns optimal '
@@ -301,6 +303,13 @@ class EnvTune(plugins.Plugin):
         # Jay's throttles (radio pause between attacks — float seconds)
         'throttle_a':                [0.2, 0.4, 0.6, 0.8, 1.0],
         'throttle_d':                [0.3, 0.5, 0.7, 0.9, 1.2],
+
+        # Mood thresholds (how many epochs before pwnagotchi flips emotion).
+        # These influence its decision to take a break / change mode and
+        # therefore indirectly affect handshake productivity. The original
+        # AI tuned these too — they are safe to learn (no firmware impact).
+        'bored_num_epochs':          [10, 15, 20, 25],
+        'sad_num_epochs':            [15, 20, 25, 30],
     }
 
     # Hard bounds for safety clamping during panic/thermal modes
@@ -317,6 +326,8 @@ class EnvTune(plugins.Plugin):
         'recon_inactive_multiplier': (1,      3),
         'throttle_a':                (0.2,  1.0),
         'throttle_d':                (0.3,  1.2),
+        'bored_num_epochs':          (10,    30),
+        'sad_num_epochs':            (15,    30),
     }
 
     # Parameters that need explicit bettercap sync (wifi.* namespace).
@@ -350,6 +361,14 @@ class EnvTune(plugins.Plugin):
         'reward_delay':              3,
         'ucb_c_floor':               0.6,      # lowest C may decay to
         'ucb_c_anneal_epochs':       500,
+        # Empirical-Bayes shrinkage strength: with n local samples per
+        # arm we only trust the local mean by n/(n+k). The remainder
+        # comes from a parent group (states sharing 2+ context dims) or
+        # the population mean. k≈5 means: 0 samples → all parent;
+        # 5 samples → 50/50; 20 samples → 80% local. Bridges the
+        # cold-start gap where 108 states × 14 params × 6 arms = 9072
+        # cells starve UCB unless we share information across cells.
+        'ucb_shrinkage_k':           5.0,
 
         # Stagnation / exploration
         'stagnation_epochs':         12,
@@ -399,6 +418,8 @@ class EnvTune(plugins.Plugin):
 
         # wpa-sec feedback
         'enable_wpasec_feedback':    True,
+        'potfile_rescan_every_n':    100,    # epochs
+        'handshake_rescan_every_n':  200,    # epochs
 
         # Logging
         'log_level':                 'INFO',
@@ -421,6 +442,7 @@ class EnvTune(plugins.Plugin):
         )}
         self._prev_reward_ema = None
         self._reward_trend    = 0.0
+        self._last_reward_breakdown = {}
         self._prev_aps_ema    = None   # persists between epochs for crash detect
 
         # Adaptive reward target — learns what "good hs/min" means here
@@ -517,6 +539,12 @@ class EnvTune(plugins.Plugin):
         self._save_queue   = queue.Queue(maxsize=4)
         self._save_thread  = None
         self._save_stop    = threading.Event()
+
+        # Web UI CSRF token — bound to the running process. POST endpoints
+        # require this token to prevent cross-site request forgery from a
+        # browser visiting an attacker page on the same LAN.
+        self._csrf_token = secrets.token_urlsafe(24)
+        self._action_log = deque(maxlen=20)
 
         # Plugin wiring
         self._agent     = None
@@ -831,17 +859,10 @@ class EnvTune(plugins.Plugin):
         if untried:
             choice = random.choice(untried)
         else:
-            # Check if state is too sparse for UCB to be meaningful
-            populated = sum(1 for a in arms if table[a]['n'] >= 3)
-            if populated < 3:
-                marginal_arm, marginal_n = self._hierarchical_marginal(param, state)
-                if marginal_arm is not None and marginal_n >= 4:
-                    choice = marginal_arm
-                else:
-                    # Fall through to UCB
-                    choice = self._sw_ucb_pick(arms, table)
-            else:
-                choice = self._sw_ucb_pick(arms, table)
+            # Shrinkage-aware UCB ALWAYS — it self-handles sparse cells
+            # by pulling toward the parent group, so we no longer need a
+            # separate hierarchical-marginal branch.
+            choice = self._sw_ucb_pick_with_state(param, state, arms, table)
 
         # Cache
         if self._profile['ucb_cache_epochs'] > 0:
@@ -849,18 +870,96 @@ class EnvTune(plugins.Plugin):
                 choice, self.epochs_seen + self._profile['ucb_cache_epochs'])
         return choice
 
-    def _sw_ucb_pick(self, arms, table):
-        """Standard sliding-window UCB1 pick."""
+    def _arm_parent_mean(self, param, state, arm):
+        """
+        Empirical-Bayes prior for an arm: weighted mean of this arm's
+        rewards across (a) states sharing 2+ context dims (preferred),
+        falling back to (b) population mean across ALL states.
+
+        Returns float prior, or None if there's no data anywhere.
+        """
+        target_parts = state.split('_')
+        parent_sum = parent_n = 0.0
+        pop_sum    = pop_n    = 0.0
+
+        for other_state, arms in self.ucb_table.get(param, {}).items():
+            d = arms.get(arm)
+            if d is None or d['n'] == 0 or not d['rewards']:
+                continue
+            m = sum(d['rewards']) / len(d['rewards'])
+            n = d['n']
+            if other_state == state:
+                continue   # we already have local in the caller
+            pop_sum += m * n
+            pop_n   += n
+            op = other_state.split('_')
+            if len(op) == 4 and len(target_parts) == 4:
+                shared = sum(1 for a, b in zip(target_parts, op) if a == b)
+                if shared >= 2:
+                    w = 1.0 if shared == 3 else 0.4
+                    parent_sum += m * w * n
+                    parent_n   += w * n
+
+        if parent_n > 0:
+            return parent_sum / parent_n
+        if pop_n > 0:
+            return pop_sum / pop_n
+        return None
+
+    def _sw_ucb_pick_with_state(self, param, state, arms, table):
+        """
+        Sliding-window UCB1 pick with empirical-Bayes shrinkage.
+
+        With 14 params × 108 states × ~6 arms = 9072 cells and only
+        ~125 epochs of real data, vanilla UCB sees almost every cell as
+        "the seeded prior". Shrinkage pulls each cell's mean toward the
+        mean of similar states (sharing 2+ context dims) so neighbours
+        contribute information. As the local sample count grows, the
+        local mean reasserts itself: weight = n/(n+k).
+        """
         # Annealed exploration constant
         if self._exploration_boost > 0:
             C = self.cfg['exploration_boost_c']
         else:
-            # Gentle decay from ucb_c → ucb_c_floor over first N epochs
             frac   = min(1.0, self.epochs_seen / self.cfg['ucb_c_anneal_epochs'])
             C_min  = self.cfg['ucb_c_floor']
             C_max  = self.cfg['ucb_c']
             C      = C_max - (C_max - C_min) * frac
 
+        k = float(self.cfg.get('ucb_shrinkage_k', 5.0))
+        total_w = sum(len(table[a]['rewards']) for a in arms)
+        best_score = -math.inf
+        best_arm   = arms[0]
+        for arm in arms:
+            d      = table[arm]
+            w_size = len(d['rewards'])
+            local  = sum(d['rewards']) / w_size if w_size > 0 else 0.0
+            prior  = self._arm_parent_mean(param, state, arm)
+            if prior is None:
+                # No information anywhere → cold-start neutral.
+                eff = local if w_size > 0 else 0.3
+            else:
+                w_loc = w_size / (w_size + k)
+                eff   = w_loc * local + (1.0 - w_loc) * prior
+            expl   = C * math.sqrt(math.log(max(2, total_w)) / max(1, w_size))
+            score  = eff + expl
+            if score > best_score:
+                best_score = score
+                best_arm   = arm
+        return best_arm
+
+    # Back-compat shim: existing call sites pass (arms, table).
+    def _sw_ucb_pick(self, arms, table):
+        # Reconstruct (param, state) from caller's frame. Only used by old
+        # callers that haven't been switched to the with_state form.
+        # For correctness we just fall back to the un-shrunk path.
+        if self._exploration_boost > 0:
+            C = self.cfg['exploration_boost_c']
+        else:
+            frac   = min(1.0, self.epochs_seen / self.cfg['ucb_c_anneal_epochs'])
+            C_min  = self.cfg['ucb_c_floor']
+            C_max  = self.cfg['ucb_c']
+            C      = C_max - (C_max - C_min) * frac
         total_w = sum(len(table[a]['rewards']) for a in arms)
         best_score = -math.inf
         best_arm   = arms[0]
@@ -913,7 +1012,8 @@ class EnvTune(plugins.Plugin):
     def _custom_reward(self, handshakes, hs_rate, missed_rate, native_reward,
                        duration_secs, lifetime_new_this_epoch,
                        active_ratio, inactive_ratio, hops_ratio,
-                       new_aps_seen, attack_efficiency_proxy, interactions):
+                       new_aps_seen, attack_efficiency_proxy, interactions,
+                       blind_ratio=0.0, bored_ratio=0.0, sad_ratio=0.0):
         """
         UNIQUE-handshake-maximising reward.
 
@@ -932,6 +1032,12 @@ class EnvTune(plugins.Plugin):
           - "underlying work" baseline         (0.04)  prevents 0-hs deadzones
                                                        from learning nothing
           - penalty: inactive ratio            (-0.05) penalty for stalls
+          - penalty: blind ratio               (-0.07) radio sees nothing —
+                                                      strong signal to
+                                                      change scanning params
+        Floor:
+          - 0.01 if there were any interactions, so UCB still distinguishes
+            'tried something but failed' from 'did nothing'.
         """
         dur_min        = max(0.01, duration_secs / 60.0)
         hs_per_min     = handshakes / dur_min
@@ -942,18 +1048,21 @@ class EnvTune(plugins.Plugin):
         target = self._adaptive_hpm_target()
 
         # 1) PRIMARY: lifetime-new captures per minute against adaptive target.
-        # We want monotonic growth at all input levels — UCB needs to
-        # distinguish "5 unique" from "10 unique" from "20 unique" so it
-        # keeps optimising past the comfortable zone. Use log scaling
-        # with a wider denominator so saturation only kicks in at very
-        # high rates (~30 unique/min, which is unrealistic in practice).
-        # x=target → 0.15, x=2*target → 0.24, x=4*target → 0.34,
-        # x=10*target → 0.50, x=20*target → 0.65, x=40*target → 0.80
+        # Telemetry showed the previous log-scaling buried the signal:
+        # ratio=1 (you HIT the target) only scored 0.20, indistinguishable
+        # from the seeded UCB prior of 0.30 once weighted. UCB therefore
+        # could not tell "good epoch" from "no data". Use a Hill-style
+        # saturation r = ratio/(ratio+k) with k=1, which gives a sharp
+        # gradient where it matters and gentle saturation above:
+        #   ratio=0       → 0.00
+        #   ratio=0.5     → 0.33
+        #   ratio=1.0     → 0.50  (target hit — clearly above 0.30 prior)
+        #   ratio=2.0     → 0.67
+        #   ratio=4.0     → 0.80
+        #   ratio=8.0     → 0.89
         if target > 0 and new_per_min > 0:
             ratio = new_per_min / target
-            # log10(1+x) capped at 1.0 only at ratio ≈ 1000
-            # divided by 5 keeps growth meaningful in normal ranges
-            new_term = min(1.0, math.log10(1.0 + ratio) / 1.5)
+            new_term = ratio / (ratio + 1.0)
         else:
             new_term = 0.0
 
@@ -976,6 +1085,21 @@ class EnvTune(plugins.Plugin):
         # 7) Inactive penalty
         inactive_pen = min(1.0, inactive_ratio)
 
+        # 7b) Blind penalty — radio "sees nothing" is a strong signal that
+        # scan params (channels / hop_recon_time / recon_time) are wrong.
+        # Original pwnagotchi AI used -0.30 here; we soften to -0.07 because
+        # we already have an explicit blind-recovery state machine that
+        # forces aggressive params, but keeping a small reward signal lets
+        # UCB shy away from arms that lead to blindness.
+        blind_pen = min(1.0, max(0.0, blind_ratio))
+
+        # 7c) Mood penalties — pwnagotchi spends time bored/sad means it
+        # was idle long enough to flip emotion. Original AI weighted these
+        # at -0.20 / -0.10; we use smaller weights since blind_pen + the
+        # active_term already cover most of the same signal.
+        bored_pen = min(1.0, max(0.0, bored_ratio))
+        sad_pen   = min(1.0, max(0.0, sad_ratio))
+
         # 8) Native reward
         native_term = min(1.0, max(0.0, _sf(native_reward)))
 
@@ -984,26 +1108,91 @@ class EnvTune(plugins.Plugin):
         work_term = min(1.0, attack_efficiency_proxy)
 
         r = (
-            0.60 * new_term         # ↑ from 0.45 — this IS the goal
+            0.60 * new_term         # this IS the goal
           + 0.10 * new_aps_term
           + 0.08 * eff_term
           + 0.06 * miss_term
           + 0.05 * active_term
           + 0.04 * hops_term
           - 0.05 * inactive_pen
+          - 0.07 * blind_pen
+          - 0.04 * sad_pen
+          - 0.03 * bored_pen
           + 0.03 * native_term
           + 0.04 * work_term
         )
+        # Activity floor: if we did anything at all this epoch, give UCB a
+        # small but non-zero gradient. Prevents arms from looking equally
+        # bad at 0.0 in long deadzones.
+        if interactions > 0 and new_per_min == 0:
+            r = max(r, 0.01)
+
+        # Optional: stash component breakdown for debug logging. Avoids
+        # recomputing in the on_epoch summary line.
+        self._last_reward_breakdown = {
+            'new':      0.60 * new_term,
+            'new_aps':  0.10 * new_aps_term,
+            'eff':      0.08 * eff_term,
+            'miss':     0.06 * miss_term,
+            'active':   0.05 * active_term,
+            'hops':     0.04 * hops_term,
+            'inact':   -0.05 * inactive_pen,
+            'blind':   -0.07 * blind_pen,
+            'sad':     -0.04 * sad_pen,
+            'bored':   -0.03 * bored_pen,
+            'native':   0.03 * native_term,
+            'work':     0.04 * work_term,
+        }
         return max(0.0, min(1.0, r))
 
     # ─────────────────────────────────────────────────────────────────────
     # EMA smoothing
     # ─────────────────────────────────────────────────────────────────────
 
+    # Per-key sane clamps. ANY input outside these is treated as a bad
+    # sample and the EMA is updated with the clamped value instead. Prevents
+    # one rogue epoch (e.g. native pwnagotchi reward returning 1e16) from
+    # poisoning the EMA forever — without that clamp we observed the
+    # 'reward' EMA get stuck at -8.5e15 across 125 epochs.
+    EMA_CLAMP = {
+        'aps':            (0.0, 5000.0),
+        'hs_rate':        (0.0, 1.0),
+        'reward':         (-2.0, 2.0),
+        'missed_rate':    (0.0, 1.0),
+        'hs_per_min':     (0.0, 600.0),
+        'active_ratio':   (0.0, 1.0),
+        'inactive_ratio': (0.0, 1.0),
+        'hops_per_epoch': (0.0, 200.0),
+        'temperature':    (-40.0, 130.0),
+        'cpu_load':       (0.0, 1.0),
+        'speed':          (0.0, 200.0),
+    }
+
     def _ema(self, key, value):
+        # Reject non-finite (nan/inf) — they would propagate forever.
+        v = _sf(value)
+        if not math.isfinite(v):
+            v = 0.0
+        # Per-key clamp to reject pathological inputs.
+        lo, hi = self.EMA_CLAMP.get(key, (-1e9, 1e9))
+        if v < lo:
+            v = lo
+        elif v > hi:
+            v = hi
         a    = float(self.cfg['ema_alpha'])
         prev = self.ema.get(key)
-        new  = _sf(value) if prev is None else (a * _sf(value) + (1.0 - a) * prev)
+        # Defensive: if a stored EMA somehow got corrupted (NaN/inf, or far
+        # outside the clamp range — e.g. legacy state from before this
+        # safeguard), drop it and treat this sample as the first.
+        if prev is not None:
+            if not math.isfinite(_sf(prev)) or prev < lo - 1e-6 or prev > hi + 1e-6:
+                prev = None
+        new  = v if prev is None else (a * v + (1.0 - a) * prev)
+        # Final defensive clamp on the output too.
+        if new < lo:
+            new = lo
+        elif new > hi:
+            new = hi
         self.ema[key] = new
         return new
 
@@ -1077,6 +1266,19 @@ class EnvTune(plugins.Plugin):
         # productive in the current GPS zone specifically
         if zone_ch_count:
             score += zone_ch_count * 1.5
+
+        # Channel-efficiency multiplier — telemetry showed the plugin
+        # was over-visiting low-yield channels (ch1: 5% HS/attack rate
+        # over 332 assocs vs ch8: 73% HS/attack rate over 41 assocs).
+        # Once a channel has enough samples to judge it, scale by
+        # success rate so the better channel keeps winning the auction.
+        # Floor 0.5× / cap 1.5× — never zero out the channel entirely.
+        attempts_lt = lt['assocs'] + lt['deauths']
+        if attempts_lt >= 30:
+            eff = lt['hs'] / max(1, attempts_lt)
+            # eff=0.05 → mul=0.65, eff=0.20 → mul=1.10, eff=0.35 → mul=1.45
+            mul = max(0.5, min(1.5, 0.5 + eff * 3.0))
+            score *= mul
 
         score *= max(0.05, 1.0 - float(self.cfg['dead_ch_lifetime_weight'])
                                  * dead_count)
@@ -1281,6 +1483,13 @@ class EnvTune(plugins.Plugin):
                         'AT_cracked':          mac_n in self._cracked_bssids,
                         'AT_efficiency':       0.0,
                         'AT_lastseen':         time.monotonic(),
+                        # First-seen epoch — used by _ap_priority_score to
+                        # surface brand-new BSSIDs aggressively. A BSSID
+                        # appearing for the first time this session AND
+                        # not in our captured set is the highest-EV moment
+                        # to attack: clients may still be in connect/roam
+                        # phase leaking EAPOL.
+                        'AT_first_seen_ep':    self.epochs_seen,
                         tag:                   1,
                     })
                     self._known_aps[apID] = entry
@@ -1308,15 +1517,49 @@ class EnvTune(plugins.Plugin):
             logging.debug(f'[envtune] _mark_ap_seen: {e}')
 
     def _evict_oldest_ap(self):
-        """Remove the oldest-seen AP entry to stay under cap."""
+        """Remove the lowest-value AP entry to stay under cap.
+
+        Eviction priority (lowest value first):
+          1. Already-captured APs (we won't attack them again — only
+             retain for the skip-list, which lives in _bcap_skip_macs).
+          2. Cracked APs (we have the password — no further value).
+          3. APs with zero attack efficiency and many attacks (PMF / hidden /
+             unreachable — wasting our attack budget if kept).
+          4. Otherwise: oldest AT_lastseen (LRU fallback).
+
+        Never evicts a fresh AP we haven't tried yet, even if it's "old".
+        """
         if not self._known_aps:
             return
+
+        def _score(k):
+            ap          = self._known_aps[k]
+            captured    = ap.get('AT_already_captured', False)
+            cracked     = ap.get('AT_cracked', False)
+            attacks     = ap.get('AT_attacks', 0)
+            handshakes  = ap.get('AT_handshake', 0)
+            efficiency  = ap.get('AT_efficiency', 0.0) or 0.0
+            lastseen    = ap.get('AT_lastseen', 0)
+            # Lower tuple = first to evict.
+            # Tier 0: cracked + captured                         (cheapest)
+            # Tier 1: captured but not cracked
+            # Tier 2: many attacks, zero handshakes (dead target)
+            # Tier 3: attacked but low-efficiency
+            # Tier 4: never attacked (precious — keep)
+            if captured and cracked:
+                tier = 0
+            elif captured:
+                tier = 1
+            elif attacks >= 5 and handshakes == 0:
+                tier = 2
+            elif attacks > 0 and efficiency < 0.05:
+                tier = 3
+            else:
+                tier = 4
+            return (tier, lastseen)
         with self._state_lock:
-            oldest_id = min(
-                self._known_aps,
-                key=lambda k: self._known_aps[k].get('AT_lastseen', 0)
-            )
-            self._known_aps.pop(oldest_id, None)
+            victim = min(self._known_aps, key=_score)
+            self._known_aps.pop(victim, None)
 
     def _rssi_trend(self, apID):
         """Positive = approaching (RSSI improving)."""
@@ -1339,11 +1582,35 @@ class EnvTune(plugins.Plugin):
             return 0.0
 
         score        = 1.0
+        attacks      = ap.get('AT_attacks', 0)
         clients      = ap.get('AT_clients', 0)
         recency      = self.epochs_seen - ap.get('AT_client_epoch', -99)
         client_fresh = recency <= int(self.cfg['client_recency_epochs'])
         if clients > 0 and client_fresh:
             score += 4.0 * min(clients, 5)
+            # FIX: a freshly-seen client on a still-uncaptured AP is the
+            # single highest-value moment — clients leak EAPOL on connect/
+            # roam and we want to be hammering deauth right then. Stack
+            # an extra bonus when the client signal is *very* fresh.
+            if recency <= 1:
+                score += 2.0 * min(clients, 3)
+
+        # Untried bonus — UCB-style optimism, encourage exploration of
+        # APs we have never attacked. Decays as attacks accumulate.
+        if attacks == 0:
+            score += 1.0
+        elif attacks <= 2:
+            score += 0.5
+
+        # Fresh-session bonus — a BSSID that appeared for the first time
+        # this session is high-EV for unique captures. Decays linearly
+        # over the next 8 epochs so the boost is real but doesn't
+        # dominate forever. Skipped if we've already captured it.
+        first_seen = ap.get('AT_first_seen_ep', -99)
+        if first_seen >= 0:
+            age = self.epochs_seen - first_seen
+            if 0 <= age < 8:
+                score += 1.5 * (1.0 - age / 8.0)
 
         score += ap.get('AT_efficiency', 0.0) * 3.0
         rssi   = _sf(ap.get('rssi', -85))
@@ -1356,6 +1623,12 @@ class EnvTune(plugins.Plugin):
         # Cracked networks are lower priority (we have the password)
         if ap.get('AT_cracked', False):
             score *= 0.3
+
+        # Many attacks, zero handshakes → likely PMF/hidden — drop priority
+        # before sinking more radio time. Don't go to zero (PMKID may still
+        # work after a roam) but mute aggressively.
+        if attacks >= 8 and ap.get('AT_handshake', 0) == 0:
+            score *= 0.25
 
         return max(0.0, score)
 
@@ -1530,6 +1803,8 @@ class EnvTune(plugins.Plugin):
         lon_idx  = int(math.floor(lon / lon_cell))
         return f'{lat_idx}:{lon_idx}'
 
+    GPS_ZONE_CAP = 500   # LRU cap to keep state file bounded
+
     def _update_gps_zone(self):
         """Update self._current_zone from current GPS fix."""
         fix = self._gps_last_fix
@@ -1547,6 +1822,19 @@ class EnvTune(plugins.Plugin):
         with self._state_lock:
             self._gps_zones[zone]['visits'] += 1
             self._gps_zones[zone]['last_seen'] = time.time()
+            # LRU cap — drop the lowest-value zone (zero handshakes & oldest)
+            # if we exceed the cap. Never evict the current zone or any
+            # zone that has produced handshakes.
+            if len(self._gps_zones) > self.GPS_ZONE_CAP:
+                victims = [
+                    (zk, zd.get('last_seen', 0.0))
+                    for zk, zd in self._gps_zones.items()
+                    if zk != zone and zd.get('hs', 0) == 0
+                ]
+                victims.sort(key=lambda x: x[1])
+                evict_n = len(self._gps_zones) - self.GPS_ZONE_CAP
+                for zk, _ts in victims[:evict_n]:
+                    self._gps_zones.pop(zk, None)
 
     # ─────────────────────────────────────────────────────────────────────
     # Parameter coupling — extensive sanity rules
@@ -1642,6 +1930,28 @@ class EnvTune(plugins.Plugin):
         if self._mood in ('sad', 'bored'):
             if _sf(p.get('sta_ttl', 300)) < 400:
                 p['sta_ttl'] = 400
+
+        # 16) 5GHz-aware recon_time. 5GHz handshakes complete faster (wider
+        # channels, stronger short-range signals) — when 5GHz APs make up
+        # a meaningful share of what we see, long recon_time wastes a cycle
+        # we could spend hopping. Snapshot _ch_lt under lock to avoid races.
+        try:
+            with self._state_lock:
+                hs_5    = sum(d['hs'] for ch, d in self._ch_lt.items() if ch >= 36)
+                hs_24   = sum(d['hs'] for ch, d in self._ch_lt.items() if ch < 36)
+                aps_5   = sum(1 for ch in self._ch_lt if ch >= 36
+                              and self._ch_lt[ch].get('visits', 0) > 0)
+                aps_24  = sum(1 for ch in self._ch_lt if ch < 36
+                              and self._ch_lt[ch].get('visits', 0) > 0)
+            tot_aps = aps_5 + aps_24
+            if tot_aps >= 5 and (aps_5 / tot_aps) > 0.30:
+                # Drop recon_time by 5s (clamped to bounds)
+                target_rt = max(self.BOUNDS['recon_time'][0],
+                                _sf(p.get('recon_time', 25)) - 5)
+                if _sf(p.get('recon_time', 25)) > target_rt:
+                    p['recon_time'] = int(target_rt)
+        except Exception:
+            pass
 
         return p
 
@@ -1882,18 +2192,43 @@ class EnvTune(plugins.Plugin):
 
             loaded_schema = _si(st.get('schema_version', 1))
 
-            self.ema.update(
-                {k: v for k, v in (st.get('ema') or {}).items() if k in self.ema}
-            )
+            # Sanitize loaded EMAs against EMA_CLAMP. Values from older
+            # plugin versions (before the clamp safeguard) could be
+            # outside the sane range — e.g. we observed reward=-8.5e15
+            # in real telemetry from a one-off bad native_reward sample.
+            # Drop those instead of poisoning the new run; _ema() will
+            # re-seed on the next epoch.
+            loaded_ema = (st.get('ema') or {})
+            for k, v in loaded_ema.items():
+                if k not in self.ema:
+                    continue
+                fv = _sf(v, default=None) if v is not None else None
+                if fv is None or not math.isfinite(fv):
+                    continue
+                lo, hi = self.EMA_CLAMP.get(k, (-1e9, 1e9))
+                if fv < lo or fv > hi:
+                    logging.warning(
+                        f'[envtune] dropped corrupt EMA {k}={fv} '
+                        f'(outside [{lo}, {hi}])')
+                    continue
+                self.ema[k] = fv
+            # Also reset the trend tracker — it depends on prev reward EMA
+            # and would carry the corruption forward as a delta.
+            self._prev_reward_ema = self.ema.get('reward')
+            self._reward_trend    = 0.0
             self.lifetime_handshakes = _si(st.get('lifetime_handshakes', 0))
             self._lifetime_new_count = _si(st.get('lifetime_new_count', 0))
 
             # Restore captured-BSSID set. Without this, lifetime_new_count
             # could desync from disk-state (deleted pcaps) and re-counting
             # an already-known BSSID as "new" again would inflate metrics.
+            # FIX: validate hex-only — a corrupted JSON entry could otherwise
+            # poison the set with garbage that never normalises out (and
+            # would inflate counters).
+            _hex = set('0123456789abcdef')
             for m in (st.get('captured_bssids') or []):
                 m_n = self._mac_norm(m)
-                if len(m_n) == 12:
+                if len(m_n) == 12 and set(m_n).issubset(_hex):
                     self._captured_bssids.add(m_n)
 
             # FIX: persist cracked-BSSID set so we don't lose this knowledge
@@ -1902,7 +2237,7 @@ class EnvTune(plugins.Plugin):
             # safety net rather than the source of truth.
             for m in (st.get('cracked_bssids') or []):
                 m_n = self._mac_norm(m)
-                if len(m_n) == 12:
+                if len(m_n) == 12 and set(m_n).issubset(_hex):
                     self._cracked_bssids.add(m_n)
 
             for k, v in (st.get('ch_lt') or {}).items():
@@ -2037,6 +2372,19 @@ class EnvTune(plugins.Plugin):
             self._atomic_write(snapshot)
         except Exception as e:
             logging.warning(f'[envtune] sync save failed: {e}')
+
+    def _enqueue_save(self, reason='manual'):
+        """Push a snapshot to the async save queue. Drops on full queue
+        (the saver coalesces; one drop is harmless)."""
+        try:
+            snapshot = self._build_state_snapshot()
+            try:
+                self._save_queue.put_nowait(snapshot)
+                logging.debug(f'[envtune] save enqueued ({reason})')
+            except queue.Full:
+                logging.debug(f'[envtune] save queue full — drop ({reason})')
+        except Exception as e:
+            logging.warning(f'[envtune] enqueue save failed ({reason}): {e}')
 
     # ═════════════════════════════════════════════════════════════════════
     # Plugin lifecycle
@@ -2267,6 +2615,11 @@ class EnvTune(plugins.Plugin):
             cpu_load     = _sf(epoch_data.get('cpu_load',             0.0))
             native_rwd   = _sf(epoch_data.get('reward', 0.0))
             ep_total     = max(1, _si(epoch_data.get('epoch', epoch)) or epoch or 1)
+            # Mood counters from pwnagotchi's own epoch tracker. Original AI
+            # gated these at 5 epochs to avoid penalising warm-up; we keep
+            # the same threshold.
+            bored_for    = _si(epoch_data.get('bored_for_epochs',     0))
+            sad_for      = _si(epoch_data.get('sad_for_epochs',       0))
 
             interactions = deauths + assocs
             hs_rate      = handshakes / interactions if interactions > 0 else 0.0
@@ -2347,10 +2700,15 @@ class EnvTune(plugins.Plugin):
             self._prev_reward_ema = r_ema
 
             # ── 5. Compute custom reward ──────────────────────────────────
+            blind_ratio = blind_for / ep_total
+            bored_ratio = (bored_for / ep_total) if bored_for >= 5 else 0.0
+            sad_ratio   = (sad_for   / ep_total) if sad_for   >= 5 else 0.0
             custom_rwd = self._custom_reward(
                 handshakes, hs_rate, missed_rate, native_rwd, dur_secs,
                 lifetime_new_this_epoch, active_ratio, inactive_ratio, hops_ratio,
-                new_aps_seen, attack_efficiency_proxy, interactions)
+                new_aps_seen, attack_efficiency_proxy, interactions,
+                blind_ratio=blind_ratio, bored_ratio=bored_ratio,
+                sad_ratio=sad_ratio)
 
             # ── 6. Nexmon crash detection ─────────────────────────────────
             if self._check_nexmon_crash(aps, interactions):
@@ -2381,13 +2739,32 @@ class EnvTune(plugins.Plugin):
                 self._ucb_cache.clear()
                 # FIX: stale decisions in the buffer were taken in the
                 # previous environment — attributing rewards from the new
-                # environment to them corrupts UCB stats.
+                # environment to them corrupts UCB stats. But discarding
+                # them entirely means UCB never learns *anything* from arms
+                # explored just before a move, which under-tests them. Give
+                # each pending decision a neutral 0.5 credit so the visit
+                # count grows but the mean is centred — UCB will still
+                # explore them again, just not pessimistically.
+                neutral = 0.5
+                for _ep, old_state, old_params in list(self._decision_buffer):
+                    for param, val in old_params.items():
+                        self._ucb_update(param, old_state, val, neutral)
                 self._reset_decision_buffer()
                 logging.info(f'[envtune] location change → '
-                             f'{boost}-ep exploration boost')
+                             f'{boost}-ep exploration boost '
+                             f'(neutral-credited buffered decisions)')
 
             # ── 9. Attribute delayed reward to earlier decision ───────────
-            delay = int(self.cfg['reward_delay'])
+            # Adaptive reward_delay: in dense AP environments, parameter
+            # changes show in the next 1-2 epochs; in sparse environments,
+            # they take longer to manifest (slow scan/handshake cadence).
+            base_delay = int(self.cfg['reward_delay'])
+            if aps_ema >= 25:
+                delay = max(2, base_delay - 1)
+            elif aps_ema <= 5:
+                delay = base_delay + 1
+            else:
+                delay = base_delay
             if len(self._decision_buffer) >= delay:
                 old_ep, old_state, old_params = list(self._decision_buffer)[-delay]
                 for param, val in old_params.items():
@@ -2395,6 +2772,32 @@ class EnvTune(plugins.Plugin):
 
             # ── 10. Stagnation check ──────────────────────────────────────
             self._check_stagnation(custom_rwd)
+
+            # ── 10b. Saturation-aware exploration boost ───────────────────
+            # If we've captured most of the APs visible in this location,
+            # there's nothing more to capture without moving — push
+            # exploration so we test scan params that might surface the
+            # last few hidden / weak APs (deeper min_rssi, longer recon).
+            now_mono = time.monotonic()
+            with self._state_lock:
+                visible = 0
+                cap_in_view = 0
+                for ap in self._known_aps.values():
+                    if ap.get('AT_cracked', False):
+                        continue
+                    if (now_mono - ap.get('AT_lastseen', 0)) > 90:
+                        continue
+                    visible += 1
+                    if ap.get('AT_already_captured', False):
+                        cap_in_view += 1
+            if visible >= 8 and cap_in_view / max(1, visible) > 0.80:
+                if self._exploration_boost <= 0:
+                    self._exploration_boost = int(
+                        self.cfg['exploration_boost_epochs'])
+                    logging.info(
+                        f'[envtune] saturation '
+                        f'({cap_in_view}/{visible} captured nearby) → '
+                        f'{self._exploration_boost}-ep exploration boost')
 
             # ── 11. Best-settings tracking ────────────────────────────────
             if self.best_reward is None or custom_rwd > self.best_reward + 0.03:
@@ -2413,9 +2816,22 @@ class EnvTune(plugins.Plugin):
                 p['min_rssi']         = self.BOUNDS['min_rssi'][0]
                 p['recon_time']       = self.BOUNDS['recon_time'][1]
                 p['hop_recon_time']   = 8
-                p['max_interactions'] = 3
+                # If thermal throttle was already in effect this epoch
+                # (step 7 ran before us), keep its lower max_interactions
+                # rather than reset to 3 — overheating + blind is the worst
+                # combo and we should not loosen the thermal lid.
+                if self._thermal_throttle:
+                    p['max_interactions'] = min(
+                        3, _si(p.get('max_interactions', 3)))
+                else:
+                    p['max_interactions'] = 3
+                if 'throttle_a' in self._active_params:
+                    # Slow association attempts to give the radio room to
+                    # finish a scan/recover from firmware indigestion.
+                    # Keep the more conservative of (blind=0.4, thermal-set).
+                    p['throttle_a'] = max(0.4, _sf(p.get('throttle_a', 0.4)))
                 if 'throttle_d' in self._active_params:
-                    p['throttle_d'] = 0.9
+                    p['throttle_d'] = max(0.9, _sf(p.get('throttle_d', 0.9)))
                 self._bettercap_sync(agent, {
                     'min_rssi': p['min_rssi'],
                 })
@@ -2621,6 +3037,73 @@ class EnvTune(plugins.Plugin):
             # ── 27. Verbose DEBUG dump ────────────────────────────────────
             logging.debug(f'[envtune] params={chosen} expl={self._exploration_boost} '
                           f'fresh_clients={total_fresh_clients}')
+            if self._last_reward_breakdown:
+                # Compact one-line component log so operators can see WHY
+                # reward landed where it did. Sorted by absolute weight so
+                # dominant terms come first.
+                items = sorted(
+                    self._last_reward_breakdown.items(),
+                    key=lambda kv: -abs(kv[1]))
+                comps = ' '.join(f'{k}={v:+.3f}' for k, v in items)
+                logging.debug(f'[envtune] reward_components: {comps}')
+
+            # ── 28. Periodic wpa-sec potfile rescan ───────────────────────
+            # External tool (cron / wpa-sec.py) appends to the potfile
+            # asynchronously; if we never rescan, freshly cracked networks
+            # keep being targeted long after we know the password.
+            if (self.cfg.get('enable_wpasec_feedback', True)
+                    and self.epochs_seen
+                    and self.epochs_seen % int(
+                        self.cfg.get('potfile_rescan_every_n', 100)) == 0):
+                try:
+                    cracked = self._scan_cracked_potfile()
+                    if cracked:
+                        with self._state_lock:
+                            added = len(cracked - self._cracked_bssids)
+                            self._cracked_bssids = cracked
+                            if added:
+                                for ap in self._known_aps.values():
+                                    if self._mac_norm(ap.get('mac', '')) in cracked:
+                                        ap['AT_cracked'] = True
+                        if added:
+                            logging.info(f'[envtune] potfile rescan: '
+                                         f'+{added} cracked BSSIDs '
+                                         f'({len(cracked)} total)')
+                except Exception as e:
+                    logging.debug(f'[envtune] potfile rescan: {e}')
+
+            # ── 29. Handshake-dir rescan watchdog ─────────────────────────
+            # If something external (wpa-sec sync, manual copy, another
+            # plugin) drops a .pcap into HANDSHAKE_DIR, we won't notice
+            # until a restart. Periodically diff the directory against
+            # our in-memory _captured_bssids and adopt anything new — so
+            # the priority loop and skip-list stay accurate.
+            if (self.epochs_seen
+                    and self.epochs_seen % int(
+                        self.cfg.get('handshake_rescan_every_n', 200)) == 0):
+                try:
+                    fs_set = self._scan_handshake_dir()
+                    with self._state_lock:
+                        new_macs = fs_set - self._captured_bssids
+                        if new_macs:
+                            self._captured_bssids |= new_macs
+                            self._lifetime_new_count = max(
+                                self._lifetime_new_count,
+                                len(self._captured_bssids))
+                            for m in new_macs:
+                                colon = _format_mac_colons(m)
+                                if colon:
+                                    self._bcap_skip_macs.add(colon)
+                    if new_macs:
+                        logging.info(
+                            f'[envtune] handshake-dir watchdog: '
+                            f'+{len(new_macs)} BSSIDs adopted from disk')
+                        try:
+                            self._push_bcap_skip_list(agent)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.debug(f'[envtune] handshake-dir watchdog: {e}')
 
             self._maybe_save()
 
@@ -2788,6 +3271,17 @@ class EnvTune(plugins.Plugin):
             logging.info(f'[envtune] handshake [{" ".join(tags)}] ch={ch} '
                          f'lifetime={self.lifetime_handshakes} '
                          f'unique_lifetime={self._lifetime_new_count}')
+
+            # FIX: push the new BSSID to bettercap's skip-list immediately
+            # rather than waiting for the next epoch. Otherwise bettercap
+            # may re-deauth a freshly captured AP for up to 30 s, wasting
+            # radio time we could spend on still-uncaptured targets. This
+            # is rate-limited via the coalescing logic in _push_bcap_skip_list.
+            if is_lifetime_new and agent is not None:
+                try:
+                    self._push_bcap_skip_list(agent)
+                except Exception as e:
+                    logging.debug(f'[envtune] immediate skip push: {e}')
         except Exception as e:
             logging.debug(f'[envtune] on_handshake: {e}')
 
@@ -2945,11 +3439,37 @@ class EnvTune(plugins.Plugin):
     # Web UI (/plugins/envtune/)
     # ═════════════════════════════════════════════════════════════════════
 
+    @staticmethod
+    def _html_response(body, status=200):
+        # Bypass Jinja: pwnagotchi UI may pass attacker-controlled SSIDs through
+        # this method, so we never let `{{ }}` reach a template engine.
+        resp = make_response(body, status)
+        resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+
+    def _plugin_base(self):
+        """Absolute URL prefix where this plugin is mounted in pwnagotchi's
+        webserver. Pwnagotchi mounts at /plugins/<class_name_lowercase>/.
+        Using absolute paths fixes the bug where a relative form action
+        like `force-save` resolves against `/plugins/` (instead of
+        `/plugins/envtune/`) when the user visits the dashboard URL
+        without a trailing slash."""
+        return '/plugins/' + type(self).__name__.lower() + '/'
+
     def on_webhook(self, path, request):
         if not self._agent:
-            return render_template_string(
-                '<html><body><h1>EnvTune not ready yet</h1></body></html>')
+            return self._html_response(
+                '<!DOCTYPE html><html><body><h1>EnvTune not ready yet</h1>'
+                '</body></html>', status=503)
         try:
+            method = (request.method if request is not None else 'GET').upper()
+
+            # POST actions (force-save / reset-stagnation / rescan-potfile)
+            if method == 'POST':
+                return self._handle_post(path, request)
+
             # Sub-paths for data export
             if path == 'export':
                 return self._endpoint_export()
@@ -2958,38 +3478,51 @@ class EnvTune(plugins.Plugin):
             if path == 'zones':
                 return self._endpoint_zones()
 
-            # Main HTML dashboard
-            ret = (f'<!DOCTYPE html><html><head>'
-                   f'<title>EnvTune v{self.__version__}</title>'
-                   f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-                   f'<style>{self._ui_css()}</style></head><body>')
-            ret += f'<h1>⚡ EnvTune v{self.__version__}</h1>'
-            ret += '<p class="subtitle">'
-            ret += (f'profile=<b>{self._profile_name}</b> | '
-                    f'gps=<b>{self._gps_source or "off"}</b> | '
-                    f'mood=<b>{self._mood}</b> | '
-                    f'mobility=<b>{self._current_mobility}</b>')
-            ret += '</p>'
-            ret += '<div class="links">'
-            ret += '<a href="export">📥 Export state JSON</a> | '
-            ret += '<a href="metrics">📊 Metrics</a> | '
-            ret += '<a href="zones">🗺️ GPS zones</a>'
-            ret += '</div>'
+            # Main HTML dashboard — every dynamic value goes through html.escape
+            # in its helper, and the whole document is returned as a raw HTML
+            # response (no Jinja evaluation).
+            version = html.escape(str(self.__version__))
+            profile = html.escape(str(self._profile_name))
+            gps_src = html.escape(str(self._gps_source or 'off'))
+            mood = html.escape(str(self._mood))
+            mobility = html.escape(str(self._current_mobility))
+            base = html.escape(self._plugin_base())
 
-            ret += self._ui_status()
-            ret += self._ui_current_params()
-            ret += self._ui_ucb_summary()
-            ret += self._ui_channels()
-            ret += self._ui_top_aps()
+            parts = [
+                '<!DOCTYPE html><html><head>',
+                f'<title>EnvTune v{version}</title>',
+                # <base> makes ALL relative URLs (links, forms, redirects)
+                # resolve against the plugin mount point, regardless of
+                # whether the visitor's URL had a trailing slash.
+                f'<base href="{base}">',
+                '<meta name="viewport" content="width=device-width, initial-scale=1">',
+                f'<style>{self._ui_css()}</style></head><body>',
+                f'<h1>⚡ EnvTune v{version}</h1>',
+                '<p class="subtitle">',
+                f'profile=<b>{profile}</b> | gps=<b>{gps_src}</b> | ',
+                f'mood=<b>{mood}</b> | mobility=<b>{mobility}</b>',
+                '</p>',
+                '<div class="links">',
+                f'<a href="{base}export">📥 Export</a> | ',
+                f'<a href="{base}metrics">📊 Metrics</a> | ',
+                f'<a href="{base}zones">🗺️ Zones</a>',
+                '</div>',
+                self._ui_actions(),
+                self._ui_status(),
+                self._ui_current_params(),
+                self._ui_ucb_summary(),
+                self._ui_channels(),
+                self._ui_top_aps(),
+            ]
             if self._gps_available and self._gps_zones:
-                ret += self._ui_gps_zones()
-            ret += '</body></html>'
-            return render_template_string(ret)
+                parts.append(self._ui_gps_zones())
+            parts.append('</body></html>')
+            return self._html_response(''.join(parts))
         except Exception as e:
             logging.exception(f'[envtune] webhook: {e}')
-            return render_template_string(
-                f'<html><body><h1>Error</h1>'
-                f'<pre>{html.escape(repr(e))}</pre></body></html>')
+            body = ('<!DOCTYPE html><html><body><h1>Error</h1>'
+                    f'<pre>{html.escape(repr(e))}</pre></body></html>')
+            return self._html_response(body, status=500)
 
     def _ui_css(self):
         return '''
@@ -3016,6 +3549,16 @@ tr:hover td{background:#111820}
 .na{color:#444}
 small{font-size:0.78em;color:#666}
 [title]{cursor:help;border-bottom:1px dotted #444}
+.actbar{margin:6px 0 12px 0}
+.actbtn{font-family:inherit;font-size:0.85em;padding:6px 12px;
+        border:1px solid #1a3a3a;background:#101820;color:#00ccff;
+        cursor:pointer;border-radius:3px}
+.actbtn.good{color:#00ff88;border-color:#003322}
+.actbtn.warn{color:#ffaa00;border-color:#332200}
+.actbtn:hover{background:#16242c}
+ul.actionlog{list-style:none;padding:0;margin:6px 0 12px 0;
+             font-size:0.82em;color:#888}
+ul.actionlog li{padding:2px 0;border-bottom:1px dotted #1a1a1a}
 '''
 
     @staticmethod
@@ -3112,18 +3655,24 @@ small{font-size:0.78em;color:#666}
         return ret
 
     def _ui_current_params(self):
-        p   = self._agent._config.get('personality', {})
+        # Defensive: agent or its config may be missing during early boot
+        # or if a fork relocates personality data.
+        try:
+            p = (self._agent._config or {}).get('personality', {}) or {}
+        except Exception:
+            p = {}
         ret = '<h2>🎛️ Current Personality Parameters</h2><table>'
         ret += ('<tr><th>Parameter</th><th>Current</th>'
                 '<th>Bounds</th><th>Status</th></tr>')
         for param, (lo, hi) in self.BOUNDS.items():
             tuned    = param in self._active_params
             cls      = '' if tuned else 'na'
-            status   = (f'<span class="good">tuning</span>' if tuned
-                        else f'<span class="na">not in fork</span>')
+            status   = ('<span class="good">tuning</span>' if tuned
+                        else '<span class="na">not in fork</span>')
             sync_tag = ' 🔄' if param in self.BETTERCAP_SYNC_MAP else ''
-            ret += (f'<tr class="{cls}"><td>{param}{sync_tag}</td>'
-                    f'<td><b>{p.get(param, "?")}</b></td>'
+            cur_val  = p.get(param, '?') if isinstance(p, dict) else '?'
+            ret += (f'<tr class="{cls}"><td>{html.escape(param)}{sync_tag}</td>'
+                    f'<td><b>{html.escape(str(cur_val))}</b></td>'
                     f'<td>[{lo},{hi}]</td><td>{status}</td></tr>')
         ret += '<tr><td colspan=4><small>🔄 = synced to bettercap '
         ret += 'in realtime via "set wifi.* N"</small></td></tr>'
@@ -3134,35 +3683,49 @@ small{font-size:0.78em;color:#666}
         aps_ema = self.ema.get('aps') or 0
         state   = self._compute_state(aps_ema)
         ret  = (f'<h2>🧠 UCB Learning — current state: '
-                f'<b style="color:#ff0">{state}</b></h2><table>')
+                f'<b style="color:#ff0">{html.escape(str(state))}</b></h2><table>')
         ret += ('<tr><th>Param</th><th>Best arm</th>'
                 '<th>Mean rwd</th><th>Window n</th>'
                 '<th>All arms (n:mean)</th></tr>')
+        # Snapshot the per-state UCB tables under lock so concurrent updates
+        # don't mutate dicts mid-iteration.
+        with self._state_lock:
+            for param in list(self.UCB_ARMS.keys()):
+                if param in self._active_params:
+                    self._ensure_state(param, state)
+            snap = {}
+            for param, arms in self.UCB_ARMS.items():
+                if param not in self._active_params:
+                    continue
+                tbl_state = self.ucb_table.get(param, {}).get(state, {})
+                snap[param] = {
+                    arm: list(tbl_state.get(arm, {}).get('rewards', []))
+                    for arm in arms
+                }
         for param, arms in self.UCB_ARMS.items():
-            if param not in self._active_params:
+            if param not in snap:
                 continue
-            self._ensure_state(param, state)
-            tbl       = self.ucb_table[param][state]
+            arm_snap  = snap[param]
             best_arm  = None
             best_mean = -1.0
             best_wn   = 0
             parts     = []
             for arm in arms:
-                d    = tbl[arm]
-                wn   = len(d['rewards'])
-                mean = sum(d['rewards']) / wn if wn > 0 else 0.0
+                rewards = arm_snap.get(arm, [])
+                wn      = len(rewards)
+                mean    = (sum(rewards) / wn) if wn > 0 else 0.0
                 parts.append(f'{arm}({wn}:{mean:.2f})')
                 if wn > 0 and mean > best_mean:
                     best_mean, best_arm, best_wn = mean, arm, wn
             if best_arm is not None:
-                ret += (f'<tr><td>{param}</td>'
-                        f'<td class="good"><b>{best_arm}</b></td>'
+                ret += (f'<tr><td>{html.escape(param)}</td>'
+                        f'<td class="good"><b>{html.escape(str(best_arm))}</b></td>'
                         f'<td>{best_mean:.3f}</td><td>{best_wn}</td>'
-                        f'<td><small>{" ".join(parts)}</small></td></tr>')
+                        f'<td><small>{html.escape(" ".join(parts))}</small></td></tr>')
             else:
-                ret += (f'<tr><td>{param}</td>'
+                ret += (f'<tr><td>{html.escape(param)}</td>'
                         f'<td colspan=3 class="na">exploring…</td>'
-                        f'<td><small>{" ".join(parts)}</small></td></tr>')
+                        f'<td><small>{html.escape(" ".join(parts))}</small></td></tr>')
         ret += '</table>'
         return ret
 
@@ -3207,8 +3770,14 @@ small{font-size:0.78em;color:#666}
                 '<th>RSSI</th><th>Trend</th><th>Clients</th>'
                 '<th>HS</th><th>Attacks</th><th>Eff.</th>'
                 '<th>Cooldown</th><th>Flags</th></tr>')
+        # Snapshot under lock so we don't iterate a dict another thread is
+        # mutating (handshake handler / on_wifi_update). Shallow-copy each
+        # AP record because helpers below access its fields after release.
+        with self._state_lock:
+            ap_snap = [(k, dict(v)) for k, v in self._known_aps.items()]
+            ep      = self.epochs_seen
         sorted_aps = sorted(
-            self._known_aps.items(),
+            ap_snap,
             key=lambda x: (-x[1].get('AT_handshake', 0),
                            -self._ap_priority_score(x[0]))
         )[:50]
@@ -3220,24 +3789,28 @@ small{font-size:0.78em;color:#666}
             t_str   = (f'<span class="good">▲{trend:+.1f}</span>' if trend > 1
                        else (f'<span class="bad">▼{trend:+.1f}</span>'
                              if trend < -1 else '—'))
-            cd_left = max(0, ap.get('AT_cooldown_until', 0) - self.epochs_seen)
+            cd_left = max(0, ap.get('AT_cooldown_until', 0) - ep)
             ncl     = ap.get('AT_clients', 0)
             flags   = []
             if ap.get('AT_pmf_detected'):     flags.append('PMF')
             if ap.get('AT_already_captured'): flags.append('✓Cap')
             if ap.get('AT_cracked'):          flags.append('🔓')
+            host    = html.escape(str(ap.get('hostname', '?'))[:24])
+            mac     = html.escape(str(ap.get('mac', '?')))
+            chan    = html.escape(str(ap.get('channel', '?')))
+            rssi    = html.escape(str(ap.get('rssi', '?')))
             ret += (f'<tr>'
-                    f'<td>{html.escape(str(ap.get("hostname", "?"))[:24])}</td>'
-                    f'<td><small>{html.escape(str(ap.get("mac", "?")))}</small></td>'
-                    f'<td>{html.escape(str(ap.get("channel", "?")))}</td>'
-                    f'<td>{html.escape(str(ap.get("rssi", "?")))}</td>'
+                    f'<td>{host}</td>'
+                    f'<td><small>{mac}</small></td>'
+                    f'<td>{chan}</td>'
+                    f'<td>{rssi}</td>'
                     f'<td>{t_str}</td>'
                     f'<td>{"🧑" * min(ncl, 5)}{ncl}</td>'
                     f'<td class="good"><b>{ap.get("AT_handshake", 0)}</b></td>'
                     f'<td>{ap.get("AT_attacks", 0)}</td>'
                     f'<td class="{eff_cls}">{eff:.2f}</td>'
                     f'<td>{"⏸ " + str(cd_left) + "ep" if cd_left > 0 else ""}</td>'
-                    f'<td>{" ".join(flags)}</td>'
+                    f'<td>{html.escape(" ".join(flags))}</td>'
                     f'</tr>')
         ret += '</table>'
         return ret
@@ -3246,22 +3819,35 @@ small{font-size:0.78em;color:#666}
         ret  = '<h2>🗺️ GPS Zone Productivity</h2><table>'
         ret += ('<tr><th>Zone</th><th>HS</th><th>Attacks</th>'
                 '<th>Visits</th><th>Top channels</th><th>Last seen</th></tr>')
-        zones = sorted(self._gps_zones.items(),
-                       key=lambda kv: -kv[1]['hs'])[:30]
+        # Deep-snapshot zones under lock so per-zone channel dicts are stable.
+        with self._state_lock:
+            zones_snap = [
+                (zk, {
+                    'hs': z.get('hs', 0),
+                    'attacks': z.get('attacks', 0),
+                    'visits': z.get('visits', 0),
+                    'last_seen': z.get('last_seen', 0),
+                    'channels': dict(z.get('channels', {})),
+                })
+                for zk, z in self._gps_zones.items()
+            ]
+        zones = sorted(zones_snap, key=lambda kv: -kv[1]['hs'])[:30]
+        now = time.time()
         for zk, zd in zones:
             top = sorted(zd['channels'].items(),
                          key=lambda x: -x[1])[:3]
             top_s = ', '.join(f'{c}:{n}' for c, n in top) or '—'
             ago = ''
             if zd.get('last_seen', 0):
-                secs = int(time.time() - zd['last_seen'])
-                ago = f'{secs//3600}h{(secs%3600)//60}m ago' if secs > 3600 else f'{secs//60}m ago'
+                secs = int(now - zd['last_seen'])
+                ago = (f'{secs//3600}h{(secs%3600)//60}m ago'
+                       if secs > 3600 else f'{secs//60}m ago')
             ret += (f'<tr><td><small>{html.escape(zk)}</small></td>'
                     f'<td class="good"><b>{zd["hs"]}</b></td>'
                     f'<td>{zd["attacks"]}</td>'
                     f'<td>{zd["visits"]}</td>'
-                    f'<td>{top_s}</td>'
-                    f'<td><small>{ago}</small></td></tr>')
+                    f'<td>{html.escape(top_s)}</td>'
+                    f'<td><small>{html.escape(ago)}</small></td></tr>')
         ret += '</table>'
         return ret
 
@@ -3271,63 +3857,316 @@ small{font-size:0.78em;color:#666}
         """Full state JSON for backup or sharing as community prior."""
         try:
             data = self._build_state_snapshot()
-            return (json.dumps(data, indent=2),
-                    200, {'Content-Type': 'application/json'})
+            resp = make_response(json.dumps(data, indent=2, default=str), 200)
+            resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
         except Exception as e:
-            return (f'Error: {html.escape(str(e))}', 500,
-                    {'Content-Type': 'text/plain'})
+            resp = make_response(f'Error: {html.escape(str(e))}', 500)
+            resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+            return resp
 
     def _endpoint_metrics(self):
-        """Prometheus-compatible metrics."""
+        """Prometheus-compatible metrics — snapshot under lock, no iteration."""
         try:
+            with self._state_lock:
+                lifetime_hs   = self.lifetime_handshakes
+                lifetime_uniq = self._lifetime_new_count
+                sess_uniq     = len(self._captured_aps)
+                sess_dups     = max(0, self.session_handshakes - sess_uniq)
+                pre_cap       = len(self._captured_bssids)
+                cracked       = len(self._cracked_bssids)
+                known_aps     = len(self._known_aps)
+                gps_zones     = len(self._gps_zones)
+                free_ch       = len(self._free_channels)
+                active_ch     = self._active_channels
+                stagnation    = self._stagnation_count
+                blind_rec     = self._blind_recovery
+                explor_boost  = self._exploration_boost
+                crash_susp    = self._crash_suspect
+                thermal       = 1 if self._thermal_throttle else 0
+                temp_ema      = self.ema.get('temperature') or 0
+                hpm           = self.ema.get('hs_per_min') or 0
+                aps_ema       = self.ema.get('aps') or 0
+                hs_rate       = self.ema.get('hs_rate') or 0
+                target_hpm    = self._adaptive_hpm_target() or 0
+                trend         = self._reward_trend or 0
+                best_rwd      = self.best_reward
+                epochs_seen   = self.epochs_seen
+                session_mono  = self.session_start_mono
+                whitelist     = len(self._whitelist_macs) + len(self._whitelist_ssids)
+                save_q        = self._save_queue.qsize() if hasattr(self, '_save_queue') else 0
+            uptime_s = max(0.0, time.monotonic() - session_mono)
             lines = [
-                '# HELP envtune_lifetime_handshakes Total handshakes captured ever (incl dups)',
+                '# HELP envtune_lifetime_handshakes Total HS captured ever (incl dups)',
                 '# TYPE envtune_lifetime_handshakes counter',
-                f'envtune_lifetime_handshakes {self.lifetime_handshakes}',
+                f'envtune_lifetime_handshakes {lifetime_hs}',
                 '# HELP envtune_unique_lifetime_bssids Distinct BSSIDs ever captured (THE GOAL)',
                 '# TYPE envtune_unique_lifetime_bssids counter',
-                f'envtune_unique_lifetime_bssids {self._lifetime_new_count}',
-                '# HELP envtune_session_handshakes Handshakes captured this session',
-                '# TYPE envtune_session_handshakes counter',
-                f'envtune_session_handshakes {len(self._captured_aps)}',
-                '# HELP envtune_known_aps Number of APs tracked in memory',
+                f'envtune_unique_lifetime_bssids {lifetime_uniq}',
+                '# HELP envtune_session_unique Distinct BSSIDs captured this session',
+                '# TYPE envtune_session_unique gauge',
+                f'envtune_session_unique {sess_uniq}',
+                '# HELP envtune_session_duplicates Duplicate handshakes this session',
+                '# TYPE envtune_session_duplicates gauge',
+                f'envtune_session_duplicates {sess_dups}',
+                '# HELP envtune_precaptured_bssids Pre-captured BSSIDs from .pcap files',
+                '# TYPE envtune_precaptured_bssids gauge',
+                f'envtune_precaptured_bssids {pre_cap}',
+                '# HELP envtune_cracked_bssids BSSIDs known cracked via wpa-sec potfile',
+                '# TYPE envtune_cracked_bssids gauge',
+                f'envtune_cracked_bssids {cracked}',
+                '# HELP envtune_whitelisted Networks excluded from tracking',
+                '# TYPE envtune_whitelisted gauge',
+                f'envtune_whitelisted {whitelist}',
+                '# HELP envtune_known_aps APs tracked in memory',
                 '# TYPE envtune_known_aps gauge',
-                f'envtune_known_aps {len(self._known_aps)}',
+                f'envtune_known_aps {known_aps}',
+                '# HELP envtune_active_channels Channels with currently visible APs',
+                '# TYPE envtune_active_channels gauge',
+                f'envtune_active_channels {active_ch}',
+                '# HELP envtune_free_channels Channels recently reported as free',
+                '# TYPE envtune_free_channels gauge',
+                f'envtune_free_channels {free_ch}',
                 '# HELP envtune_temperature_celsius CPU temperature EMA',
                 '# TYPE envtune_temperature_celsius gauge',
-                f'envtune_temperature_celsius {self.ema.get("temperature") or 0}',
-                '# HELP envtune_hs_per_min Recent handshakes per minute',
+                f'envtune_temperature_celsius {temp_ema}',
+                '# HELP envtune_hs_per_min Smoothed handshakes per minute',
                 '# TYPE envtune_hs_per_min gauge',
-                f'envtune_hs_per_min {self.ema.get("hs_per_min") or 0}',
-                '# HELP envtune_thermal_throttle Whether thermal throttle is active',
+                f'envtune_hs_per_min {hpm}',
+                '# HELP envtune_target_hpm Adaptive HPM target (90th percentile)',
+                '# TYPE envtune_target_hpm gauge',
+                f'envtune_target_hpm {target_hpm}',
+                '# HELP envtune_aps_visible_ema Smoothed visible-AP count',
+                '# TYPE envtune_aps_visible_ema gauge',
+                f'envtune_aps_visible_ema {aps_ema}',
+                '# HELP envtune_hs_per_attack Smoothed handshakes per attack',
+                '# TYPE envtune_hs_per_attack gauge',
+                f'envtune_hs_per_attack {hs_rate}',
+                '# HELP envtune_reward_trend Direction of recent reward EMA',
+                '# TYPE envtune_reward_trend gauge',
+                f'envtune_reward_trend {trend}',
+                '# HELP envtune_best_reward All-time best epoch reward',
+                '# TYPE envtune_best_reward gauge',
+                f'envtune_best_reward {best_rwd}',
+                '# HELP envtune_epochs_seen Epochs since plugin started',
+                '# TYPE envtune_epochs_seen counter',
+                f'envtune_epochs_seen {epochs_seen}',
+                '# HELP envtune_thermal_throttle 1 if thermal throttle active',
                 '# TYPE envtune_thermal_throttle gauge',
-                f'envtune_thermal_throttle {1 if self._thermal_throttle else 0}',
-                '# HELP envtune_gps_zones Number of distinct GPS zones learned',
+                f'envtune_thermal_throttle {thermal}',
+                '# HELP envtune_stagnation_streak Consecutive sub-median epochs',
+                '# TYPE envtune_stagnation_streak gauge',
+                f'envtune_stagnation_streak {stagnation}',
+                '# HELP envtune_blind_recovery_left Epochs left of blind-panic recovery',
+                '# TYPE envtune_blind_recovery_left gauge',
+                f'envtune_blind_recovery_left {blind_rec}',
+                '# HELP envtune_exploration_boost_left Epochs left of elevated UCB exploration',
+                '# TYPE envtune_exploration_boost_left gauge',
+                f'envtune_exploration_boost_left {explor_boost}',
+                '# HELP envtune_crash_suspect Suspected nexmon crash counter',
+                '# TYPE envtune_crash_suspect gauge',
+                f'envtune_crash_suspect {crash_susp}',
+                '# HELP envtune_gps_zones Distinct GPS zones learned',
                 '# TYPE envtune_gps_zones gauge',
-                f'envtune_gps_zones {len(self._gps_zones)}',
+                f'envtune_gps_zones {gps_zones}',
+                '# HELP envtune_save_queue_depth Pending state-save tasks',
+                '# TYPE envtune_save_queue_depth gauge',
+                f'envtune_save_queue_depth {save_q}',
+                '# HELP envtune_uptime_seconds Session uptime',
+                '# TYPE envtune_uptime_seconds counter',
+                f'envtune_uptime_seconds {uptime_s:.1f}',
             ]
-            return ('\n'.join(lines) + '\n', 200,
-                    {'Content-Type': 'text/plain'})
+            resp = make_response('\n'.join(lines) + '\n', 200)
+            resp.headers['Content-Type'] = 'text/plain; version=0.0.4; charset=utf-8'
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
         except Exception as e:
-            return (f'Error: {html.escape(str(e))}', 500,
-                    {'Content-Type': 'text/plain'})
+            resp = make_response(f'Error: {html.escape(str(e))}', 500)
+            resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+            return resp
 
     def _endpoint_zones(self):
         """GPS zones JSON for external mapping tools."""
         try:
-            data = {
-                zk: {
-                    'hs': z['hs'],
-                    'attacks': z['attacks'],
-                    'visits': z['visits'],
-                    'last_seen': z['last_seen'],
-                    'channels': dict(z['channels']),
+            with self._state_lock:
+                data = {
+                    zk: {
+                        'hs': z.get('hs', 0),
+                        'attacks': z.get('attacks', 0),
+                        'visits': z.get('visits', 0),
+                        'last_seen': z.get('last_seen', 0),
+                        'channels': dict(z.get('channels', {})),
+                    }
+                    for zk, z in self._gps_zones.items()
                 }
-                for zk, z in self._gps_zones.items()
-            }
-            return (json.dumps(data, indent=2),
-                    200, {'Content-Type': 'application/json'})
+            resp = make_response(json.dumps(data, indent=2, default=str), 200)
+            resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+            resp.headers['Cache-Control'] = 'no-store'
+            return resp
         except Exception as e:
-            return (f'Error: {html.escape(str(e))}', 500,
-                    {'Content-Type': 'text/plain'})
+            resp = make_response(f'Error: {html.escape(str(e))}', 500)
+            resp.headers['Content-Type'] = 'text/plain; charset=utf-8'
+            return resp
 
+    # ── Actions panel & POST handlers ─────────────────────────────────────
+
+    def _ui_actions(self):
+        """HTML form panel for operator-driven actions. Each form posts a
+        CSRF token bound to the running process."""
+        token = html.escape(self._csrf_token)
+        # Render last 8 actions (newest first)
+        with self._state_lock:
+            log_items = list(self._action_log)[-8:][::-1]
+        log_html = ''
+        if log_items:
+            log_html = '<ul class="actionlog">'
+            for ts, name, ok, msg in log_items:
+                cls = 'good' if ok else 'bad'
+                t   = time.strftime('%H:%M:%S', time.localtime(ts))
+                log_html += (f'<li><span class="{cls}">{t}</span> '
+                             f'<b>{html.escape(name)}</b> — '
+                             f'{html.escape(msg)}</li>')
+            log_html += '</ul>'
+
+        # Use the plugin's absolute mount point so the form action does
+        # NOT resolve against `/plugins/` if the user reached the page
+        # without a trailing slash (which would hit `/plugins/force-save`
+        # and 404).
+        base = html.escape(self._plugin_base())
+
+        def _form(action, label, hint, cls='warn'):
+            return (
+                f'<form method="POST" action="{base}{html.escape(action)}" '
+                f'style="display:inline-block;margin:2px 6px 2px 0">'
+                f'<input type="hidden" name="csrf" value="{token}">'
+                f'<button type="submit" class="actbtn {cls}" '
+                f'title="{html.escape(hint)}">{html.escape(label)}</button>'
+                f'</form>'
+            )
+        ret = '<h2>🛠 Actions</h2>'
+        ret += '<div class="actbar">'
+        ret += _form('force-save',
+                     '💾 Force save',
+                     'Flush plugin state JSON to disk now', 'good')
+        ret += _form('rescan-potfile',
+                     '🔓 Rescan wpa-sec',
+                     'Re-read /root/handshakes/wpa-sec.cracked.potfile',
+                     'good')
+        ret += _form('reset-stagnation',
+                     '🔄 Reset stagnation',
+                     'Clear stagnation streak & decision buffer; re-explore',
+                     'warn')
+        ret += _form('reload-whitelist',
+                     '⛔ Reload whitelist',
+                     'Reload main_whitelist & main_handshakes from config',
+                     'warn')
+        ret += _form('clear-blind',
+                     '👁 Clear blind-panic',
+                     'Drop blind-recovery counter to zero', 'warn')
+        ret += '</div>'
+        ret += log_html
+        return ret
+
+    def _record_action(self, name, ok, msg):
+        with self._state_lock:
+            self._action_log.append((time.time(), name, bool(ok), str(msg)))
+
+    def _verify_csrf(self, request):
+        try:
+            tok = ''
+            if hasattr(request, 'form'):
+                tok = request.form.get('csrf', '') or ''
+            if not tok and hasattr(request, 'values'):
+                tok = request.values.get('csrf', '') or ''
+            if not tok and hasattr(request, 'headers'):
+                tok = request.headers.get('X-CSRF-Token', '') or ''
+            return bool(tok) and hmac.compare_digest(tok, self._csrf_token)
+        except Exception:
+            return False
+
+    def _post_redirect(self, action, ok, msg, status=303):
+        # Always redirect back to dashboard so the form-submission browser
+        # context stays clean (no page-reload re-POST). Action result is
+        # visible in the action log.
+        self._record_action(action, ok, msg)
+        # Absolute path — `./` would resolve wrong if browser landed on
+        # /plugins/envtune (no trailing slash) before the POST.
+        base = self._plugin_base()
+        body = (f'<!DOCTYPE html><html><head>'
+                f'<meta http-equiv="refresh" content="1; url={html.escape(base)}">'
+                f'</head><body><p>{html.escape(msg)}</p>'
+                f'<p><a href="{html.escape(base)}">→ back</a></p></body></html>')
+        resp = make_response(body, status)
+        resp.headers['Content-Type'] = 'text/html; charset=utf-8'
+        resp.headers['Location'] = base
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+
+    def _handle_post(self, path, request):
+        if not self._verify_csrf(request):
+            return self._html_response(
+                '<!DOCTYPE html><html><body><h1>403</h1>'
+                '<p>CSRF token invalid or missing.</p></body></html>',
+                status=403)
+        try:
+            if path == 'force-save':
+                self._enqueue_save(reason='manual')
+                return self._post_redirect(
+                    'force-save', True,
+                    'State save enqueued.')
+            if path == 'rescan-potfile':
+                cracked = self._scan_cracked_potfile()
+                with self._state_lock:
+                    added = len(cracked - self._cracked_bssids)
+                    self._cracked_bssids = cracked
+                    # Mark already-known APs as cracked so the targeting loop
+                    # picks the change up immediately.
+                    for k, ap in self._known_aps.items():
+                        if self._mac_norm(ap.get('mac', '')) in cracked:
+                            ap['AT_cracked'] = True
+                self._enqueue_save(reason='potfile-rescan')
+                return self._post_redirect(
+                    'rescan-potfile', True,
+                    f'Potfile rescanned — {len(cracked)} cracked '
+                    f'BSSIDs ({added} new).')
+            if path == 'reset-stagnation':
+                with self._state_lock:
+                    self._stagnation_count = 0
+                    self._exploration_boost = max(self._exploration_boost,
+                                                  self.cfg.get(
+                                                      'stagnation_boost_epochs',
+                                                      30))
+                    if hasattr(self, '_decision_buffer'):
+                        try:
+                            self._decision_buffer.clear()
+                        except Exception:
+                            pass
+                return self._post_redirect(
+                    'reset-stagnation', True,
+                    'Stagnation streak reset and exploration boosted.')
+            if path == 'reload-whitelist':
+                if self._agent is not None:
+                    self._load_whitelist(self._agent)
+                with self._state_lock:
+                    n_mac  = len(self._whitelist_macs)
+                    n_ssid = len(self._whitelist_ssids)
+                return self._post_redirect(
+                    'reload-whitelist', True,
+                    f'Whitelist reloaded ({n_mac} MAC, {n_ssid} SSID).')
+            if path == 'clear-blind':
+                with self._state_lock:
+                    prior = self._blind_recovery
+                    self._blind_recovery = 0
+                    self._crash_suspect = 0
+                return self._post_redirect(
+                    'clear-blind', True,
+                    f'Blind-panic cleared (was {prior}).')
+        except Exception as e:
+            logging.exception(f'[envtune] POST {path}: {e}')
+            return self._post_redirect(path, False, repr(e), status=500)
+        return self._html_response(
+            '<!DOCTYPE html><html><body><h1>404</h1>'
+            f'<p>Unknown action: {html.escape(str(path))}</p>'
+            '</body></html>',
+            status=404)
