@@ -3,7 +3,7 @@
 """
 envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
 =========================================================
-Version   : 1.2.0
+Version   : 1.3.0
 License   : MIT
 Repository: https://github.com/adi170-alt/envtune
 
@@ -263,7 +263,7 @@ HW_DEFAULT_PROFILE = {
 
 class EnvTune(plugins.Plugin):
     __author__      = 'adi1708'
-    __version__     = '1.2.0'
+    __version__     = '1.3.0'
     __license__     = 'MIT'
     __description__ = ('Adaptive environment tuner — drop-in replacement '
                        'for the removed pwnagotchi AI. Learns optimal '
@@ -394,6 +394,31 @@ class EnvTune(plugins.Plugin):
         'pmf_attack_threshold':      10,
         'client_recency_epochs':     3,
         'missed_cooldown_threshold': 5,  # AP marked missed this many times → cooldown
+
+        # Re-capture policy. The plugin's reward function and channel
+        # scoring already favour brand-new BSSIDs (60% reward weight on
+        # lifetime-new captures), so we DON'T need a hard exclusion of
+        # already-captured APs to stay focused on uniques. Instead we:
+        #   - keep already-captured APs in the attack queue with low but
+        #     non-zero priority (so opportunistic re-captures still
+        #     happen — useful when a fresh client appears, when the AP's
+        #     PSK might have rotated, or when an earlier capture was
+        #     incomplete);
+        #   - only ask bettercap to skip CRACKED BSSIDs by default (we
+        #     have the password — no point recapturing).
+        # Set bcap_skip_captured=true to restore the old v1.2 behaviour
+        # where every captured BSSID is excluded at the bettercap level.
+        'bcap_skip_captured':            False,
+        'bcap_skip_cracked':             True,
+        # Priority score for already-captured-but-not-cracked APs in the
+        # in-plugin attack queue. 0.40 keeps them roughly 6× lower than
+        # a typical uncaptured AP (~2.5) but well above the 0.0 floor.
+        'recapture_priority_base':       0.40,
+        # Priority for cracked APs — much lower since we have the PSK.
+        'recapture_priority_cracked':    0.05,
+        # Bonus per fresh client (≤1 epoch ago) when recapturing —
+        # opportunistic capture window. Capped at 3 clients.
+        'recapture_client_bonus':        0.5,
 
         # Channel scheduling
         'priority_channel_weight':   0.70,
@@ -1622,10 +1647,27 @@ class EnvTune(plugins.Plugin):
         ap = self._known_aps.get(apID)
         if ap is None:
             return 0.0
-        if ap.get('AT_already_captured', False):
-            return 0.02     # low but non-zero (new opportunities possible)
         if ap.get('AT_cooldown_until', 0) > self.epochs_seen:
             return 0.0
+        # Already-captured handling: keep in the queue at LOW but non-zero
+        # priority so opportunistic re-captures (fresh clients, rotated
+        # PSK, incomplete prior capture) can still happen. The reward
+        # function and channel scoring already favour brand-new BSSIDs
+        # heavily, so the bandit will still concentrate on uniques.
+        if ap.get('AT_already_captured', False):
+            if ap.get('AT_cracked', False):
+                return _sf(self.cfg.get('recapture_priority_cracked', 0.05))
+            base = _sf(self.cfg.get('recapture_priority_base', 0.40))
+            # Fresh-client opportunistic boost — if a client just
+            # connected on a network we already have, we may catch a
+            # different EAPOL exchange (different client → different
+            # PMK derivation noise) cheaply.
+            clients = ap.get('AT_clients', 0)
+            recency = self.epochs_seen - ap.get('AT_client_epoch', -99)
+            if clients > 0 and recency <= 1:
+                bonus = _sf(self.cfg.get('recapture_client_bonus', 0.5))
+                base += bonus * min(clients, 3)
+            return base
 
         score        = 1.0
         attacks      = ap.get('AT_attacks', 0)
@@ -2194,30 +2236,57 @@ class EnvTune(plugins.Plugin):
 
     def _push_bcap_skip_list(self, agent, force=False):
         """
-        Push the running set of captured BSSIDs to bettercap's
-        wifi.assoc.skip and wifi.deauth.skip lists.
+        Push BSSIDs to bettercap's wifi.assoc.skip / wifi.deauth.skip.
 
-        Effect: bettercap stops attacking already-captured APs, freeing
-        radio time for *new* targets. This is the single biggest lever
-        for unique-handshake throughput once a session has been running.
+        The set is rebuilt fresh from `_cracked_bssids` and (optionally)
+        `_captured_bssids` based on config flags:
+          - bcap_skip_cracked  (default True)  — exclude cracked BSSIDs
+            from attacks (we have the password, recapture is wasteful)
+          - bcap_skip_captured (default False) — exclude every captured
+            BSSID, including uncracked ones. v1.2 default behaviour;
+            now opt-in because it prevents opportunistic re-captures.
 
+        Coalesces — only re-pushes when the set has changed (or force).
         Best-effort: silently no-ops on bettercap builds that don't
-        expose these properties. Coalesces — only pushes when the set
-        has grown since the last push (or force=True).
+        expose these properties.
         """
         if agent is None:
             return
-        n = len(self._bcap_skip_macs)
+        skip_captured = bool(self.cfg.get('bcap_skip_captured', False))
+        skip_cracked  = bool(self.cfg.get('bcap_skip_cracked',  True))
+
+        new_set = set()
+        with self._state_lock:
+            if skip_cracked:
+                for m in self._cracked_bssids:
+                    f = _format_mac_colons(m)
+                    if f:
+                        new_set.add(f)
+            if skip_captured:
+                for m in self._captured_bssids:
+                    f = _format_mac_colons(m)
+                    if f:
+                        new_set.add(f)
+
+        # Cache the resolved set for telemetry / UI.
+        self._bcap_skip_macs = new_set
+        n = len(new_set)
         if not force and n == self._bcap_skip_pushed_count:
             return
-        if not self._bcap_skip_macs:
-            return
         try:
-            skip_list = ','.join(sorted(self._bcap_skip_macs))
-            agent.run(f'set wifi.assoc.skip {skip_list}')
-            agent.run(f'set wifi.deauth.skip {skip_list}')
+            if new_set:
+                skip_list = ','.join(sorted(new_set))
+                agent.run(f'set wifi.assoc.skip {skip_list}')
+                agent.run(f'set wifi.deauth.skip {skip_list}')
+                logging.debug(f'[envtune] pushed {n} BSSIDs to bcap skip-list '
+                              f'(cracked={skip_cracked}, '
+                              f'captured={skip_captured})')
+            else:
+                # Actively clear stale skip rules from a previous run.
+                agent.run('set wifi.assoc.skip ')
+                agent.run('set wifi.deauth.skip ')
+                logging.debug('[envtune] cleared bcap skip-list')
             self._bcap_skip_pushed_count = n
-            logging.debug(f'[envtune] pushed {n} BSSIDs to bcap skip-list')
         except Exception as e:
             logging.debug(f'[envtune] bcap skip-list push: {e}')
 
@@ -2510,16 +2579,10 @@ class EnvTune(plugins.Plugin):
         self._lifetime_new_count_prev = self._lifetime_new_count
         self._known_aps_count_prev    = len(self._known_aps)
 
-        # Build initial bettercap skip-list from captured + cracked BSSIDs
-        # so the radio stops wasting time on duplicates we already have.
-        for m in self._captured_bssids:
-            fmac = _format_mac_colons(m)
-            if fmac:
-                self._bcap_skip_macs.add(fmac)
-        for m in self._cracked_bssids:
-            fmac = _format_mac_colons(m)
-            if fmac:
-                self._bcap_skip_macs.add(fmac)
+        # NOTE: _bcap_skip_macs is rebuilt fresh on every push from
+        # _captured_bssids and _cracked_bssids according to the
+        # bcap_skip_captured / bcap_skip_cracked config flags. The
+        # initial push happens in on_ready once the agent is wired up.
 
         # Start async save thread
         self._save_thread = threading.Thread(
@@ -3149,14 +3212,13 @@ class EnvTune(plugins.Plugin):
                             self._lifetime_new_count = max(
                                 self._lifetime_new_count,
                                 len(self._captured_bssids))
-                            for m in new_macs:
-                                colon = _format_mac_colons(m)
-                                if colon:
-                                    self._bcap_skip_macs.add(colon)
                     if new_macs:
                         logging.info(
                             f'[envtune] handshake-dir watchdog: '
                             f'+{len(new_macs)} BSSIDs adopted from disk')
+                        # _push_bcap_skip_list rebuilds from the
+                        # current _captured_bssids/_cracked_bssids sets
+                        # under the config flags — no direct add needed.
                         try:
                             self._push_bcap_skip_list(agent)
                         except Exception:
@@ -3295,11 +3357,11 @@ class EnvTune(plugins.Plugin):
                     self._captured_bssids.add(mac_n)
                     self._session_hs_bssids.add(mac_n)
                     # FIX: feed bettercap skip-list so duplicate captures
-                    # are pre-empted in the next epoch's sync. Coalesced
-                    # via _push_bcap_skip_list (only sends when set grows).
-                    colon_mac = _format_mac_colons(mac_n)
-                    if colon_mac:
-                        self._bcap_skip_macs.add(colon_mac)
+                    # _push_bcap_skip_list later this epoch will see
+                    # mac_n in _captured_bssids and add it to the bcap
+                    # skip list IF bcap_skip_captured config is true.
+                    # Default is False — captured-not-cracked APs stay
+                    # in the attack queue at low priority.
                 if apID:
                     self._captured_aps.add(apID)
                 if ch:
@@ -3331,11 +3393,13 @@ class EnvTune(plugins.Plugin):
                          f'lifetime={self.lifetime_handshakes} '
                          f'unique_lifetime={self._lifetime_new_count}')
 
-            # FIX: push the new BSSID to bettercap's skip-list immediately
-            # rather than waiting for the next epoch. Otherwise bettercap
-            # may re-deauth a freshly captured AP for up to 30 s, wasting
-            # radio time we could spend on still-uncaptured targets. This
-            # is rate-limited via the coalescing logic in _push_bcap_skip_list.
+            # Refresh bettercap's skip-list. With v1.3 default
+            # (bcap_skip_captured=False) this is mostly a no-op for
+            # uncracked captures — captured-but-uncracked APs stay
+            # attackable so opportunistic re-captures can still happen.
+            # If the user opted in to bcap_skip_captured, this push
+            # propagates the new BSSID immediately so bettercap doesn't
+            # waste a deauth cycle on it.
             if is_lifetime_new and agent is not None:
                 try:
                     self._push_bcap_skip_list(agent)
