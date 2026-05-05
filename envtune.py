@@ -3,7 +3,7 @@
 """
 envtune.py  —  Adaptive Environment Tuner for Pwnagotchi
 =========================================================
-Version   : 1.1.0
+Version   : 1.2.0
 License   : MIT
 Repository: https://github.com/adi170-alt/envtune
 
@@ -263,7 +263,7 @@ HW_DEFAULT_PROFILE = {
 
 class EnvTune(plugins.Plugin):
     __author__      = 'adi1708'
-    __version__     = '1.1.0'
+    __version__     = '1.2.0'
     __license__     = 'MIT'
     __description__ = ('Adaptive environment tuner — drop-in replacement '
                        'for the removed pwnagotchi AI. Learns optimal '
@@ -361,14 +361,22 @@ class EnvTune(plugins.Plugin):
         'reward_delay':              3,
         'ucb_c_floor':               0.6,      # lowest C may decay to
         'ucb_c_anneal_epochs':       500,
-        # Empirical-Bayes shrinkage strength: with n local samples per
-        # arm we only trust the local mean by n/(n+k). The remainder
-        # comes from a parent group (states sharing 2+ context dims) or
-        # the population mean. k≈5 means: 0 samples → all parent;
-        # 5 samples → 50/50; 20 samples → 80% local. Bridges the
-        # cold-start gap where 108 states × 14 params × 6 arms = 9072
-        # cells starve UCB unless we share information across cells.
-        'ucb_shrinkage_k':           5.0,
+        # Empirical-Bayes shrinkage strength (ANNEALED): with n local
+        # samples per arm we trust the local mean by n/(n+k). Cold-start
+        # we want HEAVY shrinkage (k_max≈5: at n=5 you're 50/50 with the
+        # parent). Late-game we want LIGHT shrinkage (k_min≈1: at n=5
+        # you're 83% local) so genuinely-better-but-undertested arms
+        # aren't pulled back to the mediocre prior forever.
+        # k decays linearly with total real samples observed, capped at
+        # ucb_shrinkage_anneal_samples. Telemetry showed v1.1's fixed
+        # k=5 was holding back arms like min_rssi=-75 (mean=0.40, n=13)
+        # whose effective mean was being pulled down to ~0.37.
+        'ucb_shrinkage_k_max':       5.0,
+        'ucb_shrinkage_k_min':       1.0,
+        'ucb_shrinkage_anneal_samples': 500,
+        # Back-compat key — if user's config sets `ucb_shrinkage_k`
+        # explicitly we keep using that as a fixed override (no anneal).
+        'ucb_shrinkage_k':           None,
 
         # Stagnation / exploration
         'stagnation_epochs':         12,
@@ -906,16 +914,54 @@ class EnvTune(plugins.Plugin):
             return pop_sum / pop_n
         return None
 
+    def _current_shrinkage_k(self):
+        """
+        Annealed shrinkage strength.
+
+        With FIXED k=5 (v1.1) we observed in real telemetry that
+        genuinely-better-but-undertested arms (e.g. min_rssi=-75 with
+        n=13, local mean=0.40) had their effective mean pulled down to
+        ~0.37 by the prior of 0.30 — slowing convergence.
+
+        Solution: k starts heavy (k_max=5) for cold-start, then anneals
+        linearly to k_min=1 as the table accumulates real samples. At
+        the end of anneal, an arm with n=13 retains 93% of its local
+        mean instead of 72%.
+
+        If ucb_shrinkage_k is set explicitly in user config (legacy
+        v1.1 behaviour), that fixed value is used and anneal is skipped.
+        """
+        fixed = self.cfg.get('ucb_shrinkage_k')
+        if fixed is not None:
+            try:
+                return max(0.0, float(fixed))
+            except (TypeError, ValueError):
+                pass
+        k_max = float(self.cfg.get('ucb_shrinkage_k_max', 5.0))
+        k_min = float(self.cfg.get('ucb_shrinkage_k_min', 1.0))
+        anneal = max(1, int(self.cfg.get('ucb_shrinkage_anneal_samples', 500)))
+        # Count total real-sample volume across the entire UCB table.
+        # This is independent of any single arm so cold-start cells
+        # benefit from heavy k even after the table is mature.
+        total = 0
+        for states in self.ucb_table.values():
+            for arms in states.values():
+                for d in arms.values():
+                    total += d.get('n', 0)
+        frac = min(1.0, total / anneal)
+        return k_max - (k_max - k_min) * frac
+
     def _sw_ucb_pick_with_state(self, param, state, arms, table):
         """
-        Sliding-window UCB1 pick with empirical-Bayes shrinkage.
+        Sliding-window UCB1 pick with annealed empirical-Bayes shrinkage.
 
-        With 14 params × 108 states × ~6 arms = 9072 cells and only
-        ~125 epochs of real data, vanilla UCB sees almost every cell as
+        With 14 params × 108 states × ~6 arms = 9072 cells and a typical
+        session of 100-300 epochs, vanilla UCB sees almost every cell as
         "the seeded prior". Shrinkage pulls each cell's mean toward the
         mean of similar states (sharing 2+ context dims) so neighbours
         contribute information. As the local sample count grows, the
-        local mean reasserts itself: weight = n/(n+k).
+        local mean reasserts itself via weight = n/(n+k); k itself
+        anneals from heavy to light over the first ~500 real samples.
         """
         # Annealed exploration constant
         if self._exploration_boost > 0:
@@ -926,7 +972,7 @@ class EnvTune(plugins.Plugin):
             C_max  = self.cfg['ucb_c']
             C      = C_max - (C_max - C_min) * frac
 
-        k = float(self.cfg.get('ucb_shrinkage_k', 5.0))
+        k = self._current_shrinkage_k()
         total_w = sum(len(table[a]['rewards']) for a in arms)
         best_score = -math.inf
         best_arm   = arms[0]
@@ -1804,6 +1850,12 @@ class EnvTune(plugins.Plugin):
         return f'{lat_idx}:{lon_idx}'
 
     GPS_ZONE_CAP = 500   # LRU cap to keep state file bounded
+    # Tier-based zone eviction: zones with many attacks and zero
+    # handshakes are confirmed-dead and should be dropped before
+    # never-touched zones (which might produce handshakes later).
+    # Telemetry showed 12/17 zones in real use with 0 HS, several with
+    # 5+ visits and 20+ attacks, accumulating indefinitely.
+    ZONE_DEAD_ATTACKS = 50
 
     def _update_gps_zone(self):
         """Update self._current_zone from current GPS fix."""
@@ -1822,18 +1874,25 @@ class EnvTune(plugins.Plugin):
         with self._state_lock:
             self._gps_zones[zone]['visits'] += 1
             self._gps_zones[zone]['last_seen'] = time.time()
-            # LRU cap — drop the lowest-value zone (zero handshakes & oldest)
-            # if we exceed the cap. Never evict the current zone or any
-            # zone that has produced handshakes.
+            # LRU cap with tier-based eviction. Never evict the current
+            # zone or any zone that has produced handshakes.
+            #   tier 0: confirmed-dead (>=50 attacks, 0 HS) — evict FIRST
+            #   tier 1: low-attack 0-HS zones (visited but not exhausted)
+            #
+            # Within each tier, oldest last_seen goes first (LRU).
             if len(self._gps_zones) > self.GPS_ZONE_CAP:
+                def _zone_evict_key(item):
+                    zk, zd = item
+                    attacks = zd.get('attacks', 0) or 0
+                    tier = 0 if attacks >= self.ZONE_DEAD_ATTACKS else 1
+                    return (tier, zd.get('last_seen', 0.0) or 0.0)
                 victims = [
-                    (zk, zd.get('last_seen', 0.0))
-                    for zk, zd in self._gps_zones.items()
+                    (zk, zd) for zk, zd in self._gps_zones.items()
                     if zk != zone and zd.get('hs', 0) == 0
                 ]
-                victims.sort(key=lambda x: x[1])
+                victims.sort(key=_zone_evict_key)
                 evict_n = len(self._gps_zones) - self.GPS_ZONE_CAP
-                for zk, _ts in victims[:evict_n]:
+                for zk, _zd in victims[:evict_n]:
                     self._gps_zones.pop(zk, None)
 
     # ─────────────────────────────────────────────────────────────────────
