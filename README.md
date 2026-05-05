@@ -22,7 +22,7 @@ The optimisation target is unambiguous: **the count of BSSIDs you have NEVER cap
 ## How it works (in 60 seconds)
 
 1. Each epoch, EnvTune classifies the current environment into one of **108 contexts** (AP density × time-of-day × reward trend × mobility).
-2. For each of **14 personality parameters**, a Sliding-Window UCB1 bandit picks a value ("arm") for the current context. **Empirical-Bayes shrinkage** pulls every cell toward its parent group (states sharing 2+ context dims) with weight `n / (n+5)`, so cold or rare contexts inherit useful priors instead of starting blind.
+2. For each of **14 personality parameters**, a Sliding-Window UCB1 bandit picks a value ("arm") for the current context. **Annealed empirical-Bayes shrinkage** pulls every cell toward its parent group (states sharing 2+ context dims) with weight `n / (n+k)`, where `k` itself decays from 5 → 1 over the first 500 real samples — so cold contexts inherit useful priors *and* genuinely-better arms aren't permanently anchored to a mediocre prior late in the session.
 3. Reward is computed `reward_delay` epochs later (default 3, **adaptive**: −1 in dense areas, +1 in sparse).
 4. The reward signal uses Hill-style saturation `r = ratio / (ratio + 1)` so a target-hit clearly outranks the cold-start prior — UCB can actually distinguish "did nothing" from "did well" from "knocked it out of the park".
 5. Channels are scheduled by combined lifetime productivity + live uncaptured-AP opportunity + a **per-channel efficiency multiplier** (low-yield channels are deprioritised even if they have many APs). Already-captured BSSIDs are pushed to bettercap's `wifi.assoc.skip` / `wifi.deauth.skip` so no airtime is wasted on duplicates.
@@ -35,7 +35,7 @@ After ~150–250 epochs in a given environment the plugin starts consistently pi
 
 ### Learning
 - **14-parameter SW-UCB1** with annealed exploration constant
-- **Empirical-Bayes shrinkage** — every UCB cell blends local mean with parent-group mean, killing the cold-start tax across 108-state space
+- **Annealed empirical-Bayes shrinkage** — every UCB cell blends local mean with parent-group mean, with shrinkage strength itself decaying as the table matures (heavy at cold-start, light once enough real data exists). Telemetry showed v1.1's fixed `k=5` was permanently dragging high-mean low-n arms back toward the prior; v1.2 lets them break free as evidence accumulates.
 - **Hierarchical priors** so rare contexts benefit from common ones
 - **Time-of-day priors** seed reasonable defaults instantly on first install
 - **Saturation-aware exploration boost** — when >80 % of visible non-cracked APs are already captured, exploration is widened so the bandit re-tests in a different direction
@@ -61,7 +61,7 @@ After ~150–250 epochs in a given environment the plugin starts consistently pi
 - **GPS zone-aware learning** — auto-detects TheyLive or stock `gps`, no config required
 - **Zone-keyed channel histogram** (HS-keyed, not visit-keyed) — re-entering a known zone immediately favours the channels that produced handshakes there
 - **Stationary vs mobile detection** via speed and AP turnover; UCB priors adjust automatically
-- **GPS zone LRU cap (500)** so very long deployments never balloon the state file
+- **GPS zone LRU cap (500)** with tier-based eviction — zones with ≥50 attacks and zero handshakes are evicted *before* never-touched zones, since those untouched zones may still produce later
 - **Heatmap of captures** with per-zone productivity scoring
 
 ### Safety
@@ -157,9 +157,16 @@ main.plugins.envtune.ucb_window          = 80
 main.plugins.envtune.save_every_n_epochs = 10
 ```
 
-**Reduce shrinkage if you trust per-state data more:**
+**Override the annealed shrinkage with a fixed value (legacy v1.1 behaviour):**
 ```toml
-main.plugins.envtune.ucb_shrinkage_k = 2.0   # default 5.0
+main.plugins.envtune.ucb_shrinkage_k = 2.0   # default: annealed 5.0 → 1.0
+```
+
+**Tune the anneal curve directly:**
+```toml
+main.plugins.envtune.ucb_shrinkage_k_max         = 5.0  # cold-start strength
+main.plugins.envtune.ucb_shrinkage_k_min         = 1.0  # late-game floor
+main.plugins.envtune.ucb_shrinkage_anneal_samples = 500 # samples to fully anneal
 ```
 
 **Frequent disk rescans (busy environments):**
@@ -321,6 +328,11 @@ Fixed in 1.1.0 — input/output of the EMA are now clamped per-key, and the load
 
 ## Versions
 
+**v1.2.0** *(current)*
+- **Annealed empirical-Bayes shrinkage** — shrinkage strength `k` decays from 5 to 1 as the UCB table accumulates real samples (over the first 500). Cold-start cells still inherit the parent prior; mature cells trust their local data. Concrete effect: an arm with `n=13, mean=0.40` had its effective mean dragged down to 0.372 in v1.1; in v1.2 late-game it sits at 0.393. Genuinely-better-but-undertested arms now converge faster.
+- **Tier-based GPS zone eviction** — zones with ≥50 attacks and zero handshakes are evicted before never-touched zones, since the untouched ones may still produce captures later. Telemetry showed 12/17 zones in real use sitting at 0 HS with attack counts up to 60+; those now drop out cleanly.
+- Three new tunables: `ucb_shrinkage_k_max`, `ucb_shrinkage_k_min`, `ucb_shrinkage_anneal_samples`. Setting `ucb_shrinkage_k` explicitly still pins shrinkage to a fixed value (legacy v1.1 behaviour).
+
 **v1.1.0**
 - Empirical-Bayes shrinkage in UCB pick (n/(n+5) blend with parent-group mean) — drastically faster convergence in the 108-state × 14-arm space
 - Hill-saturated reward gradient — UCB can finally distinguish target-hit from cold-start prior
@@ -353,7 +365,7 @@ Built on prior art by:
 - [@jayofelony](https://github.com/jayofelony) — noai fork
 - [@Sniffleupagus](https://github.com/Sniffleupagus) — `auto_tune` plugin
 - [@rai68](https://github.com/rai68) + [@AlienMajik](https://github.com/AlienMajik) — TheyLive GPS plugin
-- @adi1708 — earlier `envtune` iterations
+- @hasj — earlier `envtune` iterations
 
 ---
 
