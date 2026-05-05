@@ -1,4 +1,4 @@
-New: https://github.com/adi170-alt/pwnagotchi_plugins
+This is a old repo, you can find newer updates on: https://github.com/adi170-alt/pwnagotchi_plugins
 # EnvTune
 
 **Adaptive Environment Tuner for Pwnagotchi — drop-in replacement for the removed AI.**
